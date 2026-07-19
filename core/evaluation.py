@@ -510,7 +510,7 @@ def evaluate_global_id_with_gt(global_track_meta_df: pd.DataFrame, matched_df: p
             "is_pure_global_id": len(gt_ids) <= 1,
         })
     eval_df = pd.DataFrame(eval_rows).sort_values("global_id") if eval_rows else pd.DataFrame()
-    false_merge = int((eval_df["is_pure_global_id"] == False).sum()) if len(eval_df) else 0
+    false_merge = int((~eval_df["is_pure_global_id"]).sum()) if len(eval_df) else 0
     pure_rate = float(eval_df["is_pure_global_id"].mean()) if len(eval_df) else 0.0
     matched_global_ids = int((eval_df["num_tracks"] > 1).sum()) if len(eval_df) else 0
     summary = pd.DataFrame([{

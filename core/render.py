@@ -7,8 +7,6 @@ import cv2
 import numpy as np
 import pandas as pd
 
-from utils.helpers import ensure_dir
-
 
 BRIGHT_COLORS = [
     (255, 255, 0),    # cyan

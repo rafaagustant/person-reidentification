@@ -126,11 +126,11 @@ def build_reid_diagnostics(
     meta = global_meta_df if global_meta_df is not None else pd.DataFrame()
     summary_row = _first_row(global_summary_df)
 
-    merged = pairs[pairs["merge_status"] == True] if len(pairs) and "merge_status" in pairs else pd.DataFrame()
-    cross = pairs[pairs["same_camera"] == False] if len(pairs) and "same_camera" in pairs else pd.DataFrame()
-    cross_merged = merged[merged["same_camera"] == False] if len(merged) and "same_camera" in merged else pd.DataFrame()
-    intra_merged = merged[merged["same_camera"] == True] if len(merged) and "same_camera" in merged else pd.DataFrame()
-    unmerged_cross = cross[cross["merge_status"] == False] if len(cross) and "merge_status" in cross else pd.DataFrame()
+    merged = pairs[pairs["merge_status"]] if len(pairs) and "merge_status" in pairs else pd.DataFrame()
+    cross = pairs[~pairs["same_camera"]] if len(pairs) and "same_camera" in pairs else pd.DataFrame()
+    cross_merged = merged[~merged["same_camera"]] if len(merged) and "same_camera" in merged else pd.DataFrame()
+    intra_merged = merged[merged["same_camera"]] if len(merged) and "same_camera" in merged else pd.DataFrame()
+    unmerged_cross = cross[~cross["merge_status"]] if len(cross) and "merge_status" in cross else pd.DataFrame()
     reason_counts = merged["merge_reason"].value_counts().to_dict() if len(merged) and "merge_reason" in merged else {}
 
     row = {

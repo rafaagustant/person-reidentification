@@ -3,9 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import streamlit as st
 import pandas as pd
-from PIL import Image
 
-from core.video_io import get_video_info, make_preview_grid
+from core.video_io import make_preview_grid
 try:
     from config.gt_cases import GT_CASE_META
 except Exception:

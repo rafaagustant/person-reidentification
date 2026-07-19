@@ -921,7 +921,6 @@ def reid_config_panel(case: dict, state: dict) -> dict:
     _init_config_state(case, state)
 
     cfg = normalize_config(state["config"])
-    custom = cfg.setdefault("custom", {"tracking": False, "filter": False, "reid": False})
     recommended = _build_effective_case_recommendation(case_id)
     recommended_reid = _normalize_reid_config_values(recommended.get("reid", {}))
     current_reid = _normalize_reid_config_values(cfg.get("reid") or recommended_reid)
@@ -1396,7 +1395,7 @@ def _show_global_gallery_filtered(result: dict, case_id: str) -> None:
     elif mode == "Hanya single-camera" and len(shown):
         shown = shown[shown["cameras"].astype(str).apply(lambda text: len([x for x in text.split(",") if x.strip()]) <= 1)]
     elif mode == "Hanya mixed GID" and len(shown) and "is_mixed_gid" in shown:
-        shown = shown[shown["is_mixed_gid"] == True]
+        shown = shown[_truthy_series(shown["is_mixed_gid"])]
 
     st.subheader("Galeri Global ID")
     if len(shown) == 0:
@@ -1587,7 +1586,6 @@ def multi_camera_tracking_panel(case: dict, state: dict, use_cuda: bool, yolo_we
 
     with tabs[0]:
         st.markdown("#### Ringkasan tracking")
-        valid = result.get("valid_tracks_all", pd.DataFrame())
         score_df = result.get("tracking_score_df", pd.DataFrame())
         if score_df is None or len(score_df) == 0:
             score_df = _safe_read_csv(Path(run_dir) / "flow1_tracking_score.csv")
@@ -1751,7 +1749,6 @@ def tracking_panel(case: dict, state: dict, use_cuda: bool, yolo_weight: str | N
     result = state["tracking_result"]
     raw = result.get("raw_tracks_all", pd.DataFrame())
     valid = result.get("valid_tracks_all", pd.DataFrame())
-    summary = _tracking_summary_df(result, result.get("runtime_sec"))
     metrics_df = _tracking_metrics_df(result)
     tracking_score = _tracking_score_df(result, metrics_df)
     state["tracking_score_df"] = tracking_score
@@ -1967,7 +1964,7 @@ def _global_summary_table(result: dict) -> pd.DataFrame:
 def _merged_pairs_table(pair_df: pd.DataFrame, global_meta: pd.DataFrame | None = None) -> pd.DataFrame:
     if pair_df is None or len(pair_df) == 0 or "merge_status" not in pair_df:
         return pd.DataFrame()
-    merged = pair_df[pair_df["merge_status"] == True].copy()
+    merged = pair_df[pair_df["merge_status"]].copy()
     if len(merged) == 0:
         return merged
     if "merge_type" not in merged and {"camera_a", "camera_b"}.issubset(merged.columns):
@@ -2001,12 +1998,10 @@ def _reid_summary_metrics(result: dict, runtime: float | None) -> pd.DataFrame:
     global_summary = result.get("global_summary_df", pd.DataFrame())
     pure_rate = None
     mixed_count = None
-    global_score = None
     if global_summary is not None and len(global_summary):
         row = global_summary.iloc[0].to_dict()
         pure_rate = row.get("pure_global_id_rate")
         mixed_count = row.get("false_merge_count")
-        global_score = row.get("score")
     return pd.DataFrame([{
         "num_local_tracks": local_tracks,
         "num_global_ids": global_ids,

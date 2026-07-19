@@ -45,3 +45,5 @@ assets/cases/**/*.mkv
 
 .DS_Store
 Thumbs.db
+formula.md
+output_data_lengkap.md

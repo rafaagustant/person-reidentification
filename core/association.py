@@ -87,26 +87,16 @@ def compute_track_similarity_df(track_df: pd.DataFrame, track_features: np.ndarr
     for i, j in itertools.combinations(range(len(track_df)), 2):
         a = track_df.iloc[i]
         b = track_df.iloc[j]
-        start_a, end_a = int(a["first_frame"]), int(a["last_frame"])
-        start_b, end_b = int(b["first_frame"]), int(b["last_frame"])
-        overlap = max(0, min(end_a, end_b) - max(start_a, start_b) + 1)
-        if overlap > 0:
-            gap = 0
-        elif end_a < start_b:
-            gap = start_b - end_a - 1
-        elif end_b < start_a:
-            gap = start_a - end_b - 1
-        else:
-            gap = 0
+        gap, overlap = _temporal_gap_overlap(a, b)
         rows.append({
             "track_a": a["track_key"],
             "camera_a": a["camera"],
-            "first_frame_a": int(start_a),
-            "last_frame_a": int(end_a),
+            "first_frame_a": int(a["first_frame"]),
+            "last_frame_a": int(a["last_frame"]),
             "track_b": b["track_key"],
             "camera_b": b["camera"],
-            "first_frame_b": int(start_b),
-            "last_frame_b": int(end_b),
+            "first_frame_b": int(b["first_frame"]),
+            "last_frame_b": int(b["last_frame"]),
             "same_camera": a["camera"] == b["camera"],
             "temporal_gap": int(gap),
             "temporal_overlap": int(overlap),
@@ -116,7 +106,7 @@ def compute_track_similarity_df(track_df: pd.DataFrame, track_features: np.ndarr
 
 
 def mutual_nearest_cross_pairs(pair_df: pd.DataFrame, threshold: float) -> set[tuple[str, str]]:
-    cross = pair_df[(pair_df["same_camera"] == False) & (pair_df["cosine_similarity"] >= threshold)].copy()
+    cross = pair_df[(~pair_df["same_camera"]) & (pair_df["cosine_similarity"] >= threshold)].copy()
     if len(cross) == 0:
         return set()
 

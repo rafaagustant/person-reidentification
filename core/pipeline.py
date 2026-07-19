@@ -4,6 +4,7 @@ import gc
 import json
 import copy
 import hashlib
+import time
 from pathlib import Path
 
 import numpy as np
@@ -307,6 +308,7 @@ def _evaluate_tracking_outputs(
     gt_df: pd.DataFrame,
     gt_loader_debug: dict,
 ) -> dict:
+    # Evaluasi GT sengaja dipusatkan di sini agar format CSV tracking tetap konsisten.
     valid_eval_df = add_source_frame(valid_tracks_all, case)
     valid_eval_df = _build_track_key(valid_eval_df)
 
@@ -467,7 +469,7 @@ def run_tracking_stage(
     cameras_done = set()
 
     for camera in selected_cameras:
-        start_camera = __import__("time").perf_counter()
+        start_camera = time.perf_counter()
         video_path = Path(case["video_files"][camera])
         cam_dir = ensure_dir(run_dir / camera)
         tracking_cfg, filter_cfg = get_camera_stage_config(config_norm, camera)
@@ -507,6 +509,7 @@ def run_tracking_stage(
         finally:
             _release_yolo_model(yolo_model, use_cuda=use_cuda)
 
+        # Filter valid track menentukan kandidat crop untuk Re-ID dan gallery lokal.
         valid_df, summary_df = filter_valid_tracks(df, filter_cfg)
         df = _build_track_key(df)
         valid_df = _build_track_key(valid_df)
@@ -583,7 +586,7 @@ def run_tracking_stage(
                 "tracking_score_df": score_df,
             }
 
-        runtime = __import__("time").perf_counter() - start_camera
+        runtime = time.perf_counter() - start_camera
         camera_runtime[camera] = runtime
         score_df["runtime_sec"] = round(float(runtime), 2)
         score_df.to_csv(cam_dir / "flow1_tracking_score.csv", index=False)
@@ -741,6 +744,7 @@ def run_tracking_stage(
     valid_summary_all.to_csv(run_dir / "valid_track_summary.csv", index=False)
     valid_summary_all.to_csv(run_dir / "valid_track_summary_by_camera.csv", index=False)
 
+    # Gabungkan output semua kamera tanpa mengubah nama file konsumsi Streamlit.
     local_gallery_df = build_local_track_gallery(
         _valid_summary_only(valid_summary_all),
         run_dir / "gallery_local",
@@ -813,7 +817,7 @@ def run_tracking_stage(
     aggregate_score_df = _read_csv_if_exists(score_path)
     if len(aggregate_score_df):
         scored = tracking_score_by_camera_df[
-            tracking_score_by_camera_df.get("score_available", pd.Series(dtype=object)) == True
+            _truthy_series(tracking_score_by_camera_df.get("score_available", pd.Series(dtype=object)))
         ].copy() if len(tracking_score_by_camera_df) else pd.DataFrame()
         aggregate_score_df["camera_score_mean"] = float(scored["tracking_score"].mean()) if len(scored) else None
         aggregate_score_df["camera_score_min"] = float(scored["tracking_score"].min()) if len(scored) else None
@@ -919,6 +923,7 @@ def run_reid_stage(
         track_features = np.load(track_features_path)
         stage_log.append("Embeddings reused")
     else:
+        # Ekstraksi embedding OSNet dilakukan per crop, lalu dirata-ratakan per track.
         sampled_df = build_sampled_track_crop_df(valid_df, config_norm["filter"])
         sampled_df.to_csv(run_dir / "sampled_crop_df.csv", index=False)
 
@@ -950,6 +955,7 @@ def run_reid_stage(
     pair_df = compute_track_similarity_df(track_embedding_df, track_features)
     stage_log.append("Re-ID recomputed")
 
+    # Association membentuk Global ID dari similarity track dan batas temporal.
     global_meta_df, pair_df = assign_global_ids(
         track_embedding_df,
         pair_df,
@@ -958,7 +964,7 @@ def run_reid_stage(
 
     pair_df.to_csv(run_dir / "pair_similarity.csv", index=False)
     merged_pairs_df = (
-        pair_df[pair_df["merge_status"] == True].copy()
+        pair_df[pair_df["merge_status"]].copy()
         if len(pair_df) and "merge_status" in pair_df
         else pd.DataFrame()
     )
@@ -1144,7 +1150,13 @@ def render_reid_outputs(
 
     combined_path = None
     if len(rendered_paths) > 1:
-        output_width = 1920 if combined_layout == "fullscreen_grid" else 1280 if len(rendered_paths) == 2 else 1440 if len(rendered_paths) == 3 else None
+        output_width = None
+        if combined_layout == "fullscreen_grid":
+            output_width = 1920
+        elif len(rendered_paths) == 2:
+            output_width = 1280
+        elif len(rendered_paths) == 3:
+            output_width = 1440
         output_height = 1080 if combined_layout == "fullscreen_grid" else None
         combined_path = combine_videos_grid(
             rendered_paths,
