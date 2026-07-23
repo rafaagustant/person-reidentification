@@ -255,6 +255,7 @@ def compute_iou(box_a, box_b) -> float:
 
 
 def match_predictions_to_gt(pred_df: pd.DataFrame, gt_df: pd.DataFrame, iou_threshold=0.50) -> pd.DataFrame:
+    """Match detections to GT once per camera/source frame using deterministic IoU order."""
     pred = pred_df.copy()
     if len(pred) == 0:
         pred["gt_id"] = []
@@ -266,24 +267,31 @@ def match_predictions_to_gt(pred_df: pd.DataFrame, gt_df: pd.DataFrame, iou_thre
     pred["is_matched"] = False
     if gt_df is None or len(gt_df) == 0 or "source_frame" not in pred.columns:
         return pred
-    gt_groups = {k: g for k, g in gt_df.groupby(["camera", "source_frame"])}
-    for idx, row in pred.iterrows():
-        key = (row["camera"], int(row["source_frame"]))
-        g = gt_groups.get(key)
-        if g is None or len(g) == 0:
+    gt_groups = {key: group for key, group in gt_df.groupby(["camera", "source_frame"], sort=True)}
+    for key, prediction_group in pred.groupby(["camera", "source_frame"], sort=True):
+        gt_group = gt_groups.get(key)
+        if gt_group is None or len(gt_group) == 0:
             continue
-        pbox = [row["x1"], row["y1"], row["x2"], row["y2"]]
-        best_iou = 0.0
-        best_gt = -1
-        for _, gt in g.iterrows():
-            iou = compute_iou(pbox, [gt["x1"], gt["y1"], gt["x2"], gt["y2"]])
-            if iou > best_iou:
-                best_iou = iou
-                best_gt = int(gt["gt_id"])
-        if best_iou >= float(iou_threshold):
-            pred.at[idx, "gt_id"] = best_gt
-            pred.at[idx, "gt_iou"] = best_iou
-            pred.at[idx, "is_matched"] = True
+        candidates = []
+        for pred_idx, row in prediction_group.iterrows():
+            pbox = [row["x1"], row["y1"], row["x2"], row["y2"]]
+            for gt_idx, gt_row in gt_group.iterrows():
+                iou = compute_iou(pbox, [gt_row["x1"], gt_row["y1"], gt_row["x2"], gt_row["y2"]])
+                if iou >= float(iou_threshold):
+                    candidates.append((
+                        -float(iou), int(pred_idx), int(gt_row["gt_id"]), int(gt_idx),
+                    ))
+
+        used_predictions: set[int] = set()
+        used_gt_rows: set[int] = set()
+        for negative_iou, pred_idx, gt_id, gt_idx in sorted(candidates):
+            if pred_idx in used_predictions or gt_idx in used_gt_rows:
+                continue
+            used_predictions.add(pred_idx)
+            used_gt_rows.add(gt_idx)
+            pred.at[pred_idx, "gt_id"] = gt_id
+            pred.at[pred_idx, "gt_iou"] = -negative_iou
+            pred.at[pred_idx, "is_matched"] = True
     return pred
 
 
@@ -440,7 +448,8 @@ def build_tracking_standard_metrics(
     identity_coverage_rate = detected_gt_ids / max(1, total_gt_ids)
 
     raw_mota_simple = 1.0 - ((fn + fp + id_switch_count) / max(1, total_gt_rows))
-    mota_simple = max(0.0, min(1.0, raw_mota_simple))
+    # MOTA is an academic metric and may legitimately be negative.
+    mota_simple = raw_mota_simple
 
     return pd.DataFrame([{
         "score_available": True,
@@ -460,7 +469,7 @@ def build_tracking_standard_metrics(
         "mean_track_purity": mean_track_purity,
         "false_positive_rate": float(false_positive_rate),
         "identity_coverage_rate": float(identity_coverage_rate),
-        "note": "Metrik akademik berbasis GT. MOTA sederhana memakai FN, FP, dan ID switch dari evaluasi tracking.",
+        "note": "Metrik akademik berbasis GT. MOTA memakai FN, FP, dan ID switch dan tidak dipotong ke rentang 0-1.",
     }])
 
 
@@ -548,7 +557,7 @@ def build_reid_pairwise_evaluation(
         "pairwise_f1": None,
         "false_merge_rate": None,
         "false_split_rate": None,
-        "mean_global_id_purity": None,
+        "global_id_purity": None,
         "mixed_gid_count": None,
         "expected_global_ids": None,
         "num_global_ids": None,
@@ -670,12 +679,16 @@ def build_reid_pairwise_evaluation(
     reduction_required = max(0, int(num_eval_tracks) - expected_global_ids)
     reduction_achieved = max(0, int(num_eval_tracks) - num_global_ids)
 
-    gid_purity_rows = []
+    group_purity = []
     for _, group in eval_tracks.groupby("global_id"):
-        gt_ids = {int(x) for x in group["dominant_gt_id"].dropna().tolist() if int(x) > 0}
-        gid_purity_rows.append(len(gt_ids) <= 1)
-    mixed_gid_count = int(sum(not x for x in gid_purity_rows))
-    mean_global_id_purity = float(sum(gid_purity_rows) / max(1, len(gid_purity_rows))) if gid_purity_rows else None
+        counts = group["dominant_gt_id"].value_counts()
+        dominant_count = int(counts.iloc[0]) if len(counts) else 0
+        group_purity.append((dominant_count, int(len(group))))
+    mixed_gid_count = int(sum(dominant < total for dominant, total in group_purity))
+    global_id_purity = (
+        float(sum(dominant for dominant, _ in group_purity) / sum(total for _, total in group_purity))
+        if group_purity else None
+    )
 
     association_available = positive_pair_count > 0
     if association_available:
@@ -709,7 +722,7 @@ def build_reid_pairwise_evaluation(
         "pairwise_f1": pairwise_f1,
         "false_merge_rate": false_merge_rate,
         "false_split_rate": false_split_rate,
-        "mean_global_id_purity": mean_global_id_purity,
+        "global_id_purity": global_id_purity,
         "mixed_gid_count": mixed_gid_count,
         "expected_global_ids": expected_global_ids,
         "num_global_ids": num_global_ids,

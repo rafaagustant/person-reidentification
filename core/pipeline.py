@@ -37,8 +37,10 @@ from core.gallery import build_global_id_gallery, build_local_track_gallery, bui
 from core.models import get_device, load_osnet_model, load_yolo_model
 from core.paths import OUTPUT_ROOT
 from core.reid import (
+    build_embedding_manifest,
     build_sampled_track_crop_df,
     build_track_embedding_df,
+    embedding_cache_is_valid,
     extract_embeddings_from_sampled_df,
 )
 from core.render import combine_videos_grid, make_streamlit_playable, render_camera_video
@@ -459,6 +461,19 @@ def run_tracking_stage(
             "reid": run_config["reid_config"],
         },
         run_dir / "config_used.json",
+    )
+    save_json(
+        {
+            "run_id": run_dir.name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "case_id": case.get("case_id"),
+            "configuration_mode": config_norm.get("config_mode", "case_recommendation"),
+            "output_dir": str(run_dir),
+            "tracking_config": config_norm.get("tracking", {}),
+            "camera_configs": config_norm.get("camera_configs", {}),
+            "reid_config": config_norm.get("reid", {}),
+        },
+        run_dir / "run_manifest.json",
     )
 
     gt_df, gt_loader_debug = load_case_ground_truth_debug(case)
@@ -913,18 +928,45 @@ def run_reid_stage(
         }
     )
     save_json(config_used, config_used_path)
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = {}
+    if manifest_path.exists():
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            manifest = {}
+    manifest.update({
+        "run_id": run_dir.name,
+        "case_id": case.get("case_id"),
+        "configuration_mode": config_norm.get("config_mode", "case_recommendation"),
+        "output_dir": str(run_dir),
+        "reid_config": reid_config_used,
+    })
+    save_json(manifest, manifest_path)
 
     track_embedding_path = run_dir / "track_embedding_df.pkl"
     track_features_path = run_dir / "track_features.npy"
-    if track_embedding_path.exists() and track_features_path.exists():
-        sampled_df = _read_csv_if_exists(run_dir / "sampled_crop_df.csv")
+    embedding_manifest_path = run_dir / "embedding_manifest.json"
+    # Sampling uses the originating camera configuration, not a fallback global filter.
+    sampled_df = build_sampled_track_crop_df(
+        valid_df,
+        config_norm["filter"],
+        config_norm.get("camera_configs", {}),
+    )
+    expected_embedding_manifest = build_embedding_manifest(valid_df, sampled_df, osnet_weight)
+    cache_valid = (
+        track_embedding_path.exists()
+        and track_features_path.exists()
+        and embedding_manifest_path.exists()
+        and embedding_cache_is_valid(embedding_manifest_path, expected_embedding_manifest, track_features_path)
+    )
+    if cache_valid:
         track_embedding_df = pd.read_pickle(track_embedding_path)
         track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
         track_features = np.load(track_features_path)
         stage_log.append("Embeddings reused")
     else:
         # Ekstraksi embedding OSNet dilakukan per crop, lalu dirata-ratakan per track.
-        sampled_df = build_sampled_track_crop_df(valid_df, config_norm["filter"])
         sampled_df.to_csv(run_dir / "sampled_crop_df.csv", index=False)
 
         device = get_device(prefer_cuda=use_cuda)
@@ -950,6 +992,13 @@ def run_reid_stage(
         track_embedding_df.to_pickle(track_embedding_path)
         track_embedding_df.to_csv(run_dir / "track_embedding_summary.csv", index=False)
         np.save(track_features_path, track_features)
+        embedding_manifest = build_embedding_manifest(
+            valid_df,
+            sampled_df,
+            osnet_weight,
+            feature_dim=track_features.shape[1] if track_features.ndim == 2 else None,
+        )
+        save_json(embedding_manifest, embedding_manifest_path)
         stage_log.append("Embeddings recomputed")
 
     pair_df = compute_track_similarity_df(track_embedding_df, track_features)

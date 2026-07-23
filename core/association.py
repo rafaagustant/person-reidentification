@@ -18,7 +18,8 @@ class UnionFind:
     def union(self, a, b):
         ra, rb = self.find(a), self.find(b)
         if ra != rb:
-            self.parent[rb] = ra
+            # A stable root keeps Global ID assignment independent of row order.
+            self.parent[max(ra, rb)] = min(ra, rb)
 
 
 def _temporal_gap_overlap(a: dict, b: dict) -> tuple[int, int]:
@@ -110,18 +111,26 @@ def mutual_nearest_cross_pairs(pair_df: pd.DataFrame, threshold: float) -> set[t
     if len(cross) == 0:
         return set()
 
-    directed = []
-    for _, r in cross.iterrows():
-        directed.append({"src": r["track_a"], "dst": r["track_b"], "sim": r["cosine_similarity"]})
-        directed.append({"src": r["track_b"], "dst": r["track_a"], "sim": r["cosine_similarity"]})
-    ddf = pd.DataFrame(directed)
-    best = ddf.sort_values("sim", ascending=False).drop_duplicates("src")
-    best_map = dict(zip(best["src"], best["dst"]))
-
     pairs = set()
-    for a, b in best_map.items():
-        if best_map.get(b) == a:
-            pairs.add(tuple(sorted([a, b])))
+    # MNN is evaluated independently for every camera pair. A track may therefore
+    # form valid transitive links with tracks from more than one other camera.
+    camera_pairs = cross.apply(
+        lambda row: tuple(sorted((str(row["camera_a"]), str(row["camera_b"])))), axis=1
+    )
+    for camera_pair in sorted(camera_pairs.unique()):
+        pair_rows = cross[camera_pairs == camera_pair]
+        directed = []
+        for _, row in pair_rows.iterrows():
+            directed.extend((
+                {"src": str(row["track_a"]), "dst": str(row["track_b"]), "sim": float(row["cosine_similarity"])},
+                {"src": str(row["track_b"]), "dst": str(row["track_a"]), "sim": float(row["cosine_similarity"])},
+            ))
+        directed_df = pd.DataFrame(directed)
+        best = directed_df.sort_values(["src", "sim", "dst"], ascending=[True, False, True]).drop_duplicates("src")
+        best_map = dict(zip(best["src"], best["dst"]))
+        for a, b in best_map.items():
+            if best_map.get(b) == a:
+                pairs.add(tuple(sorted((a, b))))
     return pairs
 
 
@@ -152,6 +161,9 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
     if reid_cfg.get("use_mnn", True):
         mnn_pairs = mutual_nearest_cross_pairs(pair_df, cross_threshold)
 
+    pair_df = pair_df.sort_values(
+        ["cosine_similarity", "track_a", "track_b"], ascending=[False, True, True], kind="stable"
+    )
     for idx, r in pair_df.iterrows():
         a, b = r["track_a"], r["track_b"]
         sim = float(r["cosine_similarity"])
@@ -199,7 +211,8 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
         comps.setdefault(uf.find(tk), []).append(tk)
 
     rows = []
-    for gid_num, (_, members) in enumerate(comps.items(), start=1):
+    ordered_components = sorted((sorted(members) for members in comps.values()), key=lambda members: members[0])
+    for gid_num, members in enumerate(ordered_components, start=1):
         gid = gid_num
         for tk in members:
             rows.append({"track_key": tk, "global_id": gid})

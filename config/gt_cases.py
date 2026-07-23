@@ -2,7 +2,7 @@ from pathlib import Path
 
 ANNOTATION_ROOT = Path("assets/annotations")
 
-# Metadata evaluasi GT dipisah dari config utama agar cases.py dan presets.py tetap mengikuti repo lama.
+# Metadata ground truth untuk setiap case pengujian.
 GT_CASE_META = {
     "case_1_normal_success": {
         "annotation_dir": ANNOTATION_ROOT / "case_1",

@@ -47,3 +47,5 @@ assets/cases/**/*.mkv
 Thumbs.db
 formula.md
 output_data_lengkap.md
+
+.pytest_tmp/

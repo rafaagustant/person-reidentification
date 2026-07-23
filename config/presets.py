@@ -837,6 +837,25 @@ CASE_RECOMMENDATIONS = {
     },
 }
 
+# This is a starting point for error analysis, not a competing “best” preset.
+ERROR_ANALYSIS_TUNING_CONFIG = {
+    "tracking": {
+        "yolo_conf": 0.05, "yolo_iou": 0.50, "imgsz": 960,
+        "track_high_thresh": 0.12, "track_low_thresh": 0.03,
+        "new_track_thresh": 0.12, "match_thresh": 0.80, "track_buffer": 45,
+    },
+    "filter": {
+        "min_frames": 10, "min_crops": 10, "min_avg_conf": 0.20,
+        "min_avg_area": 800.0, "max_samples_per_track": 32,
+        "crop_selection_strategy": "quality",
+    },
+    "reid": {
+        "enable_cross_camera": True, "enable_strict_intra": True,
+        "cross_threshold": 0.80, "intra_threshold": 0.82,
+        "intra_max_gap": 30, "intra_max_overlap": 0, "use_mnn": True,
+    },
+}
+
 
 TRACKING_CONFIGS = {
     "Tracking-Balanced": {
@@ -934,6 +953,26 @@ def build_config_from_case_recommendation(case_id: str) -> dict:
         "reid": copy.deepcopy(rec.get("reid") or REID_PRESETS["reid_single_camera"]["reid"]),
         "camera_configs": camera_configs,
         "recommended_note": rec.get("note", ""),
+    }
+
+
+def build_error_analysis_config(case_id: str) -> dict:
+    """Return one permissive starting configuration while retaining case cameras."""
+    recommendation = get_case_recommendation(case_id)
+    camera_configs = {}
+    for camera in recommendation.get("camera_configs", {}):
+        camera_configs[camera] = {
+            "profile": "error_analysis_initial",
+            "tracking": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["tracking"]),
+            "filter": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["filter"]),
+        }
+    return {
+        "tracking_config_mode": "per_camera",
+        "config_mode": "error_analysis_tuning",
+        "tracking": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["tracking"]),
+        "filter": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["filter"]),
+        "reid": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["reid"]),
+        "camera_configs": camera_configs,
     }
 
 
@@ -1062,6 +1101,19 @@ def normalize_config(config: dict | None) -> dict:
         base["visual_preset"] = copy.deepcopy(config["visual_preset"])
     base["tracking_config_mode"] = "per_camera"
     base["camera_configs"] = copy.deepcopy(config.get("camera_configs", {}))
+    for section_name in ("tracking", "filter", "reid"):
+        for key, value in base[section_name].items():
+            if key.endswith("threshold") or key in {"yolo_conf", "yolo_iou", "match_thresh", "min_avg_conf"}:
+                if not 0.0 <= float(value) <= 1.0:
+                    raise ValueError(f"{section_name}.{key} must be between 0 and 1")
+    if base["tracking"]["track_low_thresh"] > base["tracking"]["track_high_thresh"]:
+        raise ValueError("tracking.track_low_thresh cannot exceed track_high_thresh")
+    for key in ("imgsz", "track_buffer"):
+        if int(base["tracking"][key]) < 0:
+            raise ValueError(f"tracking.{key} cannot be negative")
+    for key in ("min_frames", "min_crops", "min_avg_area", "max_samples_per_track"):
+        if float(base["filter"][key]) < 0:
+            raise ValueError(f"filter.{key} cannot be negative")
     if "raw" in config:
         base["raw"] = copy.deepcopy(config["raw"])
     return base
