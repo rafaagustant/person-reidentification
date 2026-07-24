@@ -838,7 +838,7 @@ CASE_RECOMMENDATIONS = {
 }
 
 # This is a starting point for error analysis, not a competing “best” preset.
-ERROR_ANALYSIS_TUNING_CONFIG = {
+INITIAL_ANALYSIS_CONFIG = {
     "tracking": {
         "yolo_conf": 0.05, "yolo_iou": 0.50, "imgsz": 960,
         "track_high_thresh": 0.12, "track_low_thresh": 0.03,
@@ -963,15 +963,15 @@ def build_error_analysis_config(case_id: str) -> dict:
     for camera in recommendation.get("camera_configs", {}):
         camera_configs[camera] = {
             "profile": "error_analysis_initial",
-            "tracking": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["tracking"]),
-            "filter": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["filter"]),
+            "tracking": copy.deepcopy(INITIAL_ANALYSIS_CONFIG["tracking"]),
+            "filter": copy.deepcopy(INITIAL_ANALYSIS_CONFIG["filter"]),
         }
     return {
         "tracking_config_mode": "per_camera",
         "config_mode": "error_analysis_tuning",
-        "tracking": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["tracking"]),
-        "filter": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["filter"]),
-        "reid": copy.deepcopy(ERROR_ANALYSIS_TUNING_CONFIG["reid"]),
+        "tracking": copy.deepcopy(INITIAL_ANALYSIS_CONFIG["tracking"]),
+        "filter": copy.deepcopy(INITIAL_ANALYSIS_CONFIG["filter"]),
+        "reid": copy.deepcopy(INITIAL_ANALYSIS_CONFIG["reid"]),
         "camera_configs": camera_configs,
     }
 
@@ -1100,12 +1100,16 @@ def normalize_config(config: dict | None) -> dict:
     if "visual_preset" in config:
         base["visual_preset"] = copy.deepcopy(config["visual_preset"])
     base["tracking_config_mode"] = "per_camera"
+    if "config_mode" in config:
+        base["config_mode"] = str(config["config_mode"])
     base["camera_configs"] = copy.deepcopy(config.get("camera_configs", {}))
     for section_name in ("tracking", "filter", "reid"):
         for key, value in base[section_name].items():
             if key.endswith("threshold") or key in {"yolo_conf", "yolo_iou", "match_thresh", "min_avg_conf"}:
                 if not 0.0 <= float(value) <= 1.0:
                     raise ValueError(f"{section_name}.{key} must be between 0 and 1")
+    if not 0.0 < float(base["tracking"]["yolo_iou"]) <= 1.0:
+        raise ValueError("tracking.yolo_iou must be greater than 0 and at most 1")
     if base["tracking"]["track_low_thresh"] > base["tracking"]["track_high_thresh"]:
         raise ValueError("tracking.track_low_thresh cannot exceed track_high_thresh")
     for key in ("imgsz", "track_buffer"):

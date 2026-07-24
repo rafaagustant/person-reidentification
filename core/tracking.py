@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import logging
 
 import cv2
 import pandas as pd
@@ -8,6 +9,9 @@ import torch
 import yaml
 
 from utils.helpers import ensure_dir
+
+
+logger = logging.getLogger(__name__)
 
 
 TRACK_COLUMNS = [
@@ -216,6 +220,13 @@ def process_video_tracking(
     tracker_yaml = make_botsort_yaml(config, output_dir)
     device = 0 if use_cuda and torch.cuda.is_available() else "cpu"
     save_tracking_runtime_manifest(config, tracker_yaml, output_dir, tracking_fingerprint, device=device)
+    logger.info(
+        "Tracking %s with yolo_conf=%s, yolo_iou=%s, imgsz=%s",
+        camera,
+        float(config.get("yolo_conf", 0.25)),
+        float(config.get("yolo_iou", 0.50)),
+        int(config.get("imgsz", 640)),
+    )
 
     if not video_path.exists():
         raise FileNotFoundError(f"Video tidak ditemukan: {video_path}")

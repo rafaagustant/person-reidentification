@@ -407,8 +407,7 @@ def build_tracking_standard_metrics(
             "precision": None,
             "recall": None,
             "f1": None,
-            "raw_mota_simple": None,
-            "mota_simple": None,
+            "mota": None,
             "motp_iou": None,
             "id_switch_count": 0,
             "fragmentation_avg": None,
@@ -447,9 +446,8 @@ def build_tracking_standard_metrics(
     detected_gt_ids = int(matched["gt_id"].nunique()) if "gt_id" in matched and len(matched) else 0
     identity_coverage_rate = detected_gt_ids / max(1, total_gt_ids)
 
-    raw_mota_simple = 1.0 - ((fn + fp + id_switch_count) / max(1, total_gt_rows))
+    mota = 1.0 - ((fn + fp + id_switch_count) / max(1, total_gt_rows))
     # MOTA is an academic metric and may legitimately be negative.
-    mota_simple = raw_mota_simple
 
     return pd.DataFrame([{
         "score_available": True,
@@ -461,15 +459,14 @@ def build_tracking_standard_metrics(
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
-        "raw_mota_simple": float(raw_mota_simple),
-        "mota_simple": float(mota_simple),
+        "mota": float(mota),
         "motp_iou": float(motp_iou),
         "id_switch_count": id_switch_count,
         "fragmentation_avg": fragmentation_avg,
         "mean_track_purity": mean_track_purity,
         "false_positive_rate": float(false_positive_rate),
         "identity_coverage_rate": float(identity_coverage_rate),
-        "note": "Metrik akademik berbasis GT. MOTA memakai FN, FP, dan ID switch dan tidak dipotong ke rentang 0-1.",
+        "note": "Metrik akademik berbasis GT.",
     }])
 
 
@@ -498,6 +495,44 @@ def build_gt_coverage_detail(matched_df: pd.DataFrame, gt_df: pd.DataFrame) -> p
     out["mean_conf"] = out["mean_conf"].fillna(0.0)
     out["coverage_per_gt"] = out["detected_frames"] / out["gt_frames"].clip(lower=1)
     return out.sort_values(["camera", "gt_id"]).reset_index(drop=True)
+
+
+def build_gt_temporal_coverage(matched_df: pd.DataFrame, gt_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = ["camera", "gt_id", "gt_first_source_frame", "gt_last_source_frame", "gt_frame_count", "matched_first_source_frame", "matched_last_source_frame", "matched_frame_count", "missed_frame_count", "temporal_coverage", "matched_track_keys", "num_matched_tracks", "longest_missed_gap", "coverage_status"]
+    if gt_df is None or len(gt_df) == 0:
+        return pd.DataFrame(columns=columns), pd.DataFrame()
+    matched = matched_df[matched_df["gt_id"] > 0].copy() if matched_df is not None and len(matched_df) and "gt_id" in matched_df else pd.DataFrame()
+    rows = []
+    for (camera, gt_id), group in gt_df.groupby(["camera", "gt_id"], sort=True):
+        frames = sorted(group["source_frame"].dropna().astype(int).unique().tolist())
+        matched_group = matched[(matched["camera"] == camera) & (matched["gt_id"] == gt_id)] if len(matched) else pd.DataFrame()
+        matched_frames = set(matched_group["source_frame"].dropna().astype(int).unique().tolist()) if len(matched_group) else set()
+        matched_frames &= set(frames)
+        longest_gap = current_gap = 0
+        previous = None
+        for frame in frames:
+            if previous is None or frame != previous + 1:
+                current_gap = 0
+            if frame in matched_frames:
+                current_gap = 0
+            else:
+                current_gap += 1
+                longest_gap = max(longest_gap, current_gap)
+            previous = frame
+        tracks = sorted(matched_group["track_key"].dropna().astype(str).unique().tolist()) if len(matched_group) and "track_key" in matched_group else []
+        gt_count = len(frames)
+        matched_count = len(matched_frames)
+        coverage = matched_count / gt_count if gt_count else None
+        status = "Tidak berlaku" if not gt_count else "Tercakup penuh" if coverage == 1 else "Tercakup sebagian" if coverage and coverage > 0 else "Tidak ditemukan"
+        rows.append({"camera": camera, "gt_id": int(gt_id), "gt_first_source_frame": frames[0] if frames else None, "gt_last_source_frame": frames[-1] if frames else None, "gt_frame_count": gt_count, "matched_first_source_frame": min(matched_frames) if matched_frames else None, "matched_last_source_frame": max(matched_frames) if matched_frames else None, "matched_frame_count": matched_count, "missed_frame_count": max(0, gt_count - matched_count), "temporal_coverage": coverage, "matched_track_keys": ", ".join(tracks), "num_matched_tracks": len(tracks), "longest_missed_gap": longest_gap, "coverage_status": status})
+    coverage_df = pd.DataFrame(rows, columns=columns)
+    summary_rows = []
+    for gt_id, group in coverage_df.groupby("gt_id", sort=True):
+        total = int(group["gt_frame_count"].sum())
+        found = int(group["matched_frame_count"].sum())
+        tracks = sorted({track.strip() for value in group["matched_track_keys"] for track in str(value).split(",") if track.strip()})
+        summary_rows.append({"gt_id": int(gt_id), "cameras": ", ".join(sorted(group["camera"].astype(str).tolist())), "num_cameras": int(group["camera"].nunique()), "total_gt_frame_count": total, "total_matched_frame_count": found, "total_missed_frame_count": max(0, total - found), "overall_temporal_coverage": found / total if total else None, "all_matched_track_keys": ", ".join(tracks), "num_matched_tracks": len(tracks)})
+    return coverage_df, pd.DataFrame(summary_rows)
 
 
 def evaluate_global_id_with_gt(global_track_meta_df: pd.DataFrame, matched_df: pd.DataFrame):

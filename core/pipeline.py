@@ -24,6 +24,7 @@ from core.diagnostics import (
 from core.evaluation import (
     add_source_frame,
     build_gt_coverage_detail,
+    build_gt_temporal_coverage,
     build_reid_pairwise_evaluation,
     build_gt_debug_info,
     build_tracking_standard_metrics,
@@ -112,6 +113,14 @@ def _merge_full_track_span(
             avg_area=("area", "mean"),
         )
     )
+    if "source_frame" in valid_df:
+        source_frames = (
+            valid_df.groupby("track_key")["source_frame"]
+            .apply(lambda values: tuple(sorted({int(value) for value in values.dropna()})))
+            .rename("source_frames")
+            .reset_index()
+        )
+        track_span_df = track_span_df.merge(source_frames, on="track_key", how="left")
 
     drop_cols = [
         "first_frame",
@@ -119,6 +128,7 @@ def _merge_full_track_span(
         "num_frames",
         "avg_conf",
         "avg_area",
+        "source_frames",
     ]
 
     out = track_embedding_df.drop(columns=drop_cols, errors="ignore").merge(
@@ -273,8 +283,8 @@ def _sync_dirty_single_camera_config(config: dict, selected_cameras: list[str]) 
     return out
 
 
-def _tracking_fingerprint(tracking_cfg: dict) -> str:
-    payload = json.dumps(tracking_cfg or {}, sort_keys=True, separators=(",", ":"))
+def _tracking_fingerprint(tracking_cfg: dict, filter_cfg: dict | None = None, video_path: str | Path | None = None) -> str:
+    payload = json.dumps({"tracking": tracking_cfg or {}, "filter": filter_cfg or {}, "video": str(video_path or "")}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -323,6 +333,7 @@ def _evaluate_tracking_outputs(
         matched_df = _build_track_key(matched_df)
         tracking_eval_df = evaluate_tracking_with_gt(matched_df, gt_df)
         gt_coverage_df = build_gt_coverage_detail(matched_df, gt_df)
+        gt_temporal_coverage_df, gt_temporal_coverage_summary_df = build_gt_temporal_coverage(matched_df, gt_df)
         track_summary_gt_df = build_track_summary_with_gt(matched_df)
         tracking_standard_metrics_df = build_tracking_standard_metrics(
             matched_df,
@@ -339,6 +350,17 @@ def _evaluate_tracking_outputs(
         matched_df.to_csv(run_dir / "tracking_rows_with_gt.csv", index=False)
         tracking_eval_df.to_csv(run_dir / "tracking_evaluation.csv", index=False)
         gt_coverage_df.to_csv(run_dir / "gt_coverage_detail.csv", index=False)
+        gt_temporal_coverage_df.to_csv(run_dir / "gt_temporal_coverage.csv", index=False)
+        gt_temporal_coverage_summary_df.to_csv(run_dir / "gt_temporal_coverage_summary.csv", index=False)
+        manifest_path = run_dir / "run_manifest.json"
+        if manifest_path.exists():
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            manifest["gt_temporal_coverage_path"] = str(run_dir / "gt_temporal_coverage.csv")
+            manifest["gt_temporal_coverage_summary_path"] = str(run_dir / "gt_temporal_coverage_summary.csv")
+            save_json(manifest, manifest_path)
         track_summary_gt_df.to_csv(run_dir / "track_summary_with_gt.csv", index=False)
         tracking_standard_metrics_df.to_csv(run_dir / "tracking_standard_metrics.csv", index=False)
         eval_outputs = {
@@ -347,6 +369,8 @@ def _evaluate_tracking_outputs(
             "matched_df": matched_df,
             "tracking_eval_df": tracking_eval_df,
             "gt_coverage_df": gt_coverage_df,
+            "gt_temporal_coverage_df": gt_temporal_coverage_df,
+            "gt_temporal_coverage_summary_df": gt_temporal_coverage_summary_df,
             "track_summary_gt_df": track_summary_gt_df,
             "tracking_standard_metrics_df": tracking_standard_metrics_df,
             "gt_debug": gt_debug,
@@ -412,23 +436,27 @@ def run_tracking_stage(
     run_dir: str | Path | None = None,
     progress_callback=None,
     cameras_to_run: list[str] | None = None,
+    camera_names: list[str] | None = None,
 ) -> dict:
     run_dir = Path(run_dir) if run_dir else create_run_dir(case)
     ensure_dir(run_dir)
 
     config_norm = normalize_config(config)
-    selected_cameras = list(cameras_to_run) if cameras_to_run else list(case["cameras"])
+    selected_cameras = list(camera_names) if camera_names is not None else (list(cameras_to_run) if cameras_to_run else list(case["cameras"]))
+    unknown_cameras = set(selected_cameras).difference(case.get("cameras", []))
+    if unknown_cameras:
+        raise ValueError(f"Kamera tidak tersedia pada case: {sorted(unknown_cameras)}")
     config_norm = _sync_dirty_single_camera_config(config_norm, selected_cameras)
     if len(case.get("cameras", [])) > 3:
         raise ValueError("Multi-camera tracking mendukung maksimal 3 kamera/video.")
 
     expected_camera_tracking = {}
     for camera in case["cameras"]:
-        tracking_cfg, _ = get_camera_stage_config(config_norm, camera)
+        tracking_cfg, filter_cfg = get_camera_stage_config(config_norm, camera)
         cam_dir = run_dir / camera
         expected_camera_tracking[camera] = {
             "tracking": tracking_cfg,
-            "tracking_fingerprint": _tracking_fingerprint(tracking_cfg),
+            "tracking_fingerprint": _tracking_fingerprint(tracking_cfg, filter_cfg, case.get("video_files", {}).get(camera)),
             "tracker_yaml_path": str(cam_dir / "generated_tracker_config_used.yaml"),
             "tracking_runtime_manifest_path": str(cam_dir / "tracking_runtime_manifest.yaml"),
         }
@@ -658,7 +686,7 @@ def run_tracking_stage(
         expected_fingerprint = expected_camera_tracking.get(camera, {}).get("tracking_fingerprint")
         loaded_fingerprint = (loaded_camera_config or {}).get("tracking_fingerprint")
         if not loaded_fingerprint and (loaded_camera_config or {}).get("tracking"):
-            loaded_fingerprint = _tracking_fingerprint((loaded_camera_config or {}).get("tracking", {}))
+            loaded_fingerprint = _tracking_fingerprint((loaded_camera_config or {}).get("tracking", {}), (loaded_camera_config or {}).get("filter", {}), case.get("video_files", {}).get(camera))
         if (
             camera not in selected_cameras
             and expected_fingerprint
@@ -881,6 +909,7 @@ def run_reid_stage(
 
     valid_df = pd.read_csv(valid_path)
     valid_df = _build_track_key(valid_df)
+    valid_df = add_source_frame(valid_df, case)
     stage_log = ["Tracking reused"]
 
     config_norm = normalize_config(config)
@@ -953,6 +982,14 @@ def run_reid_stage(
         config_norm["filter"],
         config_norm.get("camera_configs", {}),
     )
+    if len(sampled_df) == 0:
+        crop_paths = valid_df["crop_path"] if "crop_path" in valid_df else pd.Series(dtype=str)
+        existing_crops = int(sum(Path(str(path)).is_file() for path in crop_paths))
+        raise ValueError(
+            "Sampling crop Re-ID kosong: "
+            f"valid_track={valid_df['track_key'].nunique() if 'track_key' in valid_df else 0}, "
+            f"baris_valid={len(valid_df)}, crop_tersedia={existing_crops}, direktori={run_dir}."
+        )
     expected_embedding_manifest = build_embedding_manifest(valid_df, sampled_df, osnet_weight)
     cache_valid = (
         track_embedding_path.exists()
@@ -961,11 +998,17 @@ def run_reid_stage(
         and embedding_cache_is_valid(embedding_manifest_path, expected_embedding_manifest, track_features_path)
     )
     if cache_valid:
-        track_embedding_df = pd.read_pickle(track_embedding_path)
-        track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
-        track_features = np.load(track_features_path)
-        stage_log.append("Embeddings reused")
-    else:
+        try:
+            track_embedding_df = pd.read_pickle(track_embedding_path)
+            track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
+            track_features = np.load(track_features_path)
+            if track_features.ndim != 2 or len(track_embedding_df) != len(track_features):
+                raise ValueError("cache embedding memiliki dimensi atau jumlah track yang tidak sesuai")
+            stage_log.append("Embeddings reused")
+        except Exception:
+            cache_valid = False
+            stage_log.append("Embedding cache invalid; recomputing")
+    if not cache_valid:
         # Ekstraksi embedding OSNet dilakukan per crop, lalu dirata-ratakan per track.
         sampled_df.to_csv(run_dir / "sampled_crop_df.csv", index=False)
 
@@ -988,6 +1031,8 @@ def run_reid_stage(
             crop_features,
         )
         track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
+        if len(track_embedding_df) == 0 or track_features.size == 0:
+            raise RuntimeError("Embedding track kosong meskipun valid track dan crop tersedia.")
 
         track_embedding_df.to_pickle(track_embedding_path)
         track_embedding_df.to_csv(run_dir / "track_embedding_summary.csv", index=False)
@@ -1001,6 +1046,7 @@ def run_reid_stage(
         save_json(embedding_manifest, embedding_manifest_path)
         stage_log.append("Embeddings recomputed")
 
+    track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
     pair_df = compute_track_similarity_df(track_embedding_df, track_features)
     stage_log.append("Re-ID recomputed")
 

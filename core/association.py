@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 import numpy as np
 import pandas as pd
 
@@ -35,6 +36,58 @@ def _temporal_gap_overlap(a: dict, b: dict) -> tuple[int, int]:
     else:
         gap = 0
     return int(gap), int(overlap)
+
+
+def _source_frame_set(track: pd.Series) -> set[int] | None:
+    value = track.get("source_frames")
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, str):
+        if not value.strip():
+            return None
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(value, (list, tuple, set, np.ndarray, pd.Series)):
+        return None
+    return {int(frame) for frame in value if pd.notna(frame)}
+
+
+def _source_temporal_metrics(a: pd.Series, b: pd.Series) -> dict:
+    frames_a = _source_frame_set(a)
+    frames_b = _source_frame_set(b)
+    fallback = {
+        "start_source_frame_a": a.get("first_source_frame", a.get("first_frame")),
+        "end_source_frame_a": a.get("last_source_frame", a.get("last_frame")),
+        "start_source_frame_b": b.get("first_source_frame", b.get("first_frame")),
+        "end_source_frame_b": b.get("last_source_frame", b.get("last_frame")),
+        "overlap_frame_count": pd.NA,
+        "temporal_gap": pd.NA,
+        "temporal_status": "Tidak tersedia",
+    }
+    if not frames_a or not frames_b:
+        return fallback
+    start_a, end_a = min(frames_a), max(frames_a)
+    start_b, end_b = min(frames_b), max(frames_b)
+    overlap = len(frames_a.intersection(frames_b))
+    if overlap:
+        gap, status = 0, "Overlap"
+    elif end_a < start_b:
+        gap, status = start_b - end_a - 1, "Berurutan" if start_b - end_a - 1 == 0 else "Terpisah"
+    elif end_b < start_a:
+        gap, status = start_a - end_b - 1, "Berurutan" if start_a - end_b - 1 == 0 else "Terpisah"
+    else:
+        gap, status = 0, "Berurutan"
+    return {
+        "start_source_frame_a": start_a,
+        "end_source_frame_a": end_a,
+        "start_source_frame_b": start_b,
+        "end_source_frame_b": end_b,
+        "overlap_frame_count": overlap,
+        "temporal_gap": int(max(0, gap)),
+        "temporal_status": status,
+    }
 
 
 def _merged_cluster_members(uf: UnionFind, track_keys: list[str], a: str, b: str) -> list[str]:
@@ -79,8 +132,16 @@ def compute_track_similarity_df(track_df: pd.DataFrame, track_features: np.ndarr
             "first_frame_b",
             "last_frame_b",
             "same_camera",
+            "association_temporal_gap",
+            "association_temporal_overlap",
             "temporal_gap",
             "temporal_overlap",
+            "start_source_frame_a",
+            "end_source_frame_a",
+            "start_source_frame_b",
+            "end_source_frame_b",
+            "overlap_frame_count",
+            "temporal_status",
             "cosine_similarity",
         ])
 
@@ -89,6 +150,7 @@ def compute_track_similarity_df(track_df: pd.DataFrame, track_features: np.ndarr
         a = track_df.iloc[i]
         b = track_df.iloc[j]
         gap, overlap = _temporal_gap_overlap(a, b)
+        source_temporal = _source_temporal_metrics(a, b)
         rows.append({
             "track_a": a["track_key"],
             "camera_a": a["camera"],
@@ -99,9 +161,11 @@ def compute_track_similarity_df(track_df: pd.DataFrame, track_features: np.ndarr
             "first_frame_b": int(b["first_frame"]),
             "last_frame_b": int(b["last_frame"]),
             "same_camera": a["camera"] == b["camera"],
-            "temporal_gap": int(gap),
+            "association_temporal_gap": int(gap),
+            "association_temporal_overlap": int(overlap),
             "temporal_overlap": int(overlap),
             "cosine_similarity": float(sim[i, j]),
+            **source_temporal,
         })
     return pd.DataFrame(rows).sort_values("cosine_similarity", ascending=False).reset_index(drop=True)
 
@@ -161,6 +225,15 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
     if reid_cfg.get("use_mnn", True):
         mnn_pairs = mutual_nearest_cross_pairs(pair_df, cross_threshold)
 
+    def mnn_status_code(row: pd.Series) -> str:
+        if bool(row["same_camera"]) or not reid_cfg.get("enable_cross_camera", False) or not reid_cfg.get("use_mnn", True):
+            return "not_applicable"
+        if float(row["cosine_similarity"]) < cross_threshold:
+            return "not_evaluated"
+        return "passed" if tuple(sorted((str(row["track_a"]), str(row["track_b"])))) in mnn_pairs else "failed"
+
+    pair_df["mnn_status_code"] = pair_df.apply(mnn_status_code, axis=1)
+
     pair_df = pair_df.sort_values(
         ["cosine_similarity", "track_a", "track_b"], ascending=[False, True, True], kind="stable"
     )
@@ -168,8 +241,8 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
         a, b = r["track_a"], r["track_b"]
         sim = float(r["cosine_similarity"])
         same_camera = bool(r["same_camera"])
-        gap = int(r["temporal_gap"])
-        overlap = int(r["temporal_overlap"])
+        gap = int(r.get("association_temporal_gap", r["temporal_gap"]))
+        overlap = int(r.get("association_temporal_overlap", r["temporal_overlap"]))
         should_merge = False
         reason = "not_merged"
 
