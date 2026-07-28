@@ -38,7 +38,7 @@ def _temporal_gap_overlap(a: dict, b: dict) -> tuple[int, int]:
     return int(gap), int(overlap)
 
 
-def _source_frame_set(track: pd.Series) -> set[int] | None:
+def _source_frame_set(track: pd.Series | dict) -> set[int] | None:
     value = track.get("source_frames")
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return None
@@ -52,6 +52,25 @@ def _source_frame_set(track: pd.Series) -> set[int] | None:
     if not isinstance(value, (list, tuple, set, np.ndarray, pd.Series)):
         return None
     return {int(frame) for frame in value if pd.notna(frame)}
+
+
+def _actual_temporal_gap_overlap(a: pd.Series | dict, b: pd.Series | dict) -> tuple[int, int]:
+    frames_a = _source_frame_set(a)
+    frames_b = _source_frame_set(b)
+    if not frames_a or not frames_b:
+        return _temporal_gap_overlap(a, b)
+
+    overlap = len(frames_a.intersection(frames_b))
+    if overlap:
+        return 0, int(overlap)
+
+    start_a, end_a = min(frames_a), max(frames_a)
+    start_b, end_b = min(frames_b), max(frames_b)
+    if end_a < start_b:
+        return int(start_b - end_a - 1), 0
+    if end_b < start_a:
+        return int(start_a - end_b - 1), 0
+    return 0, 0
 
 
 def _source_temporal_metrics(a: pd.Series, b: pd.Series) -> dict:
@@ -109,12 +128,11 @@ def _cluster_temporal_conflict(
         if left_meta["camera"] != right_meta["camera"]:
             continue
 
-        gap, overlap = _temporal_gap_overlap(left_meta, right_meta)
+        gap, overlap = _actual_temporal_gap_overlap(left_meta, right_meta)
         if overlap > intra_max_overlap or gap > intra_max_gap:
-            conflict_set = {left, right}
-            if conflict_set == candidate_set:
-                return True, "blocked_same_camera_temporal_conflict"
-            return True, "blocked_cluster_temporal_conflict"
+            kind = "overlap" if overlap > intra_max_overlap else "gap"
+            scope = "same_camera" if {left, right} == candidate_set else "cluster"
+            return True, f"blocked_{scope}_temporal_{kind}"
 
     return False, ""
 
@@ -208,6 +226,7 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
             "camera": row["camera"],
             "first_frame": int(row["first_frame"]),
             "last_frame": int(row["last_frame"]),
+            "source_frames": row.get("source_frames"),
         }
         for _, row in track_df.iterrows()
     }
@@ -220,6 +239,10 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
     intra_threshold = float(reid_cfg.get("intra_threshold", 0.80))
     intra_max_gap = int(reid_cfg.get("intra_max_gap", 30))
     intra_max_overlap = int(reid_cfg.get("intra_max_overlap", 0))
+    pair_df["association_type"] = pair_df["same_camera"].map(lambda value: "intra_camera" if bool(value) else "cross_camera")
+    pair_df["threshold"] = pair_df["same_camera"].map(lambda value: intra_threshold if bool(value) else cross_threshold)
+    pair_df["similarity_margin"] = pair_df["cosine_similarity"].astype(float) - pair_df["threshold"].astype(float)
+    pair_df["rejection_reason"] = ""
 
     mnn_pairs = set()
     if reid_cfg.get("use_mnn", True):
@@ -241,26 +264,49 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
         a, b = r["track_a"], r["track_b"]
         sim = float(r["cosine_similarity"])
         same_camera = bool(r["same_camera"])
-        gap = int(r.get("association_temporal_gap", r["temporal_gap"]))
-        overlap = int(r.get("association_temporal_overlap", r["temporal_overlap"]))
+        source_gap = r.get("temporal_gap")
+        source_overlap = r.get("overlap_frame_count")
+        gap = (
+            int(source_gap)
+            if pd.notna(source_gap)
+            else int(r.get("association_temporal_gap", r["temporal_gap"]))
+        )
+        overlap = (
+            int(source_overlap)
+            if pd.notna(source_overlap)
+            else int(r.get("association_temporal_overlap", r["temporal_overlap"]))
+        )
         should_merge = False
         reason = "not_merged"
+        rejection_reasons = []
 
-        if same_camera and reid_cfg.get("enable_strict_intra", False):
-            if sim >= intra_threshold and gap <= intra_max_gap and overlap <= intra_max_overlap:
+        if not np.isfinite(sim):
+            rejection_reasons.append("rejected_invalid_embedding")
+        elif same_camera and reid_cfg.get("enable_strict_intra", False):
+            if sim < intra_threshold:
+                rejection_reasons.append("rejected_similarity")
+            if gap > intra_max_gap:
+                rejection_reasons.append("rejected_temporal_gap")
+            if overlap > intra_max_overlap:
+                rejection_reasons.append("rejected_temporal_overlap")
+            if not rejection_reasons:
                 should_merge = True
                 reason = "intra_fragment_recovery"
-            elif sim >= intra_threshold and gap <= intra_max_gap and overlap > intra_max_overlap:
-                reason = "rejected_temporal_overlap"
         elif (not same_camera) and reid_cfg.get("enable_cross_camera", False):
-            if sim >= cross_threshold:
+            if sim < cross_threshold:
+                rejection_reasons.append("rejected_similarity")
+            else:
                 if reid_cfg.get("use_mnn", True):
                     if tuple(sorted([a, b])) in mnn_pairs:
                         should_merge = True
                         reason = "cross_camera_mnn"
+                    else:
+                        rejection_reasons.append("rejected_mnn")
                 else:
                     should_merge = True
                     reason = "cross_camera_threshold"
+        else:
+            rejection_reasons.append("rejected_camera_rule")
 
         if should_merge:
             proposed_members = _merged_cluster_members(uf, track_keys, a, b)
@@ -274,10 +320,15 @@ def assign_global_ids(track_df: pd.DataFrame, pair_df: pd.DataFrame, reid_cfg: d
             if has_conflict:
                 should_merge = False
                 reason = conflict_reason
+                rejection_reasons.append(
+                    "rejected_temporal_overlap" if "overlap" in conflict_reason else "rejected_temporal_gap"
+                )
             else:
                 uf.union(a, b)
                 pair_df.at[idx, "merge_status"] = True
         pair_df.at[idx, "merge_reason"] = reason
+        if not should_merge:
+            pair_df.at[idx, "rejection_reason"] = ";".join(dict.fromkeys(rejection_reasons)) or "rejected_camera_rule"
 
     comps = {}
     for tk in track_keys:

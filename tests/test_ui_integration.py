@@ -1,14 +1,18 @@
+import json
+
 import pandas as pd
+import ui.config_panel as config_panel
 
 from config.cases import DEMO_CASES
-from config.presets import CASE_RECOMMENDATIONS, INITIAL_ANALYSIS_CONFIG, build_error_analysis_config
-from core.tracking import safe_progress
-from ui.config_panel import ALLOWED_TUNING_IMGSZ, _apply_scope, configuration_for_mode
+from config.presets import CASE_RECOMMENDATIONS, INITIAL_ANALYSIS_CONFIG, build_initial_analysis_config, normalize_config
+from core.tracking import filter_valid_tracks, safe_progress
+from ui.config_panel import ALLOWED_TUNING_IMGSZ, THREE_DECIMAL_KEYS, _apply_scope, configuration_for_mode
 from ui.components import widget_key
 from ui.app import validate_reid_inputs
 from ui.state import camera_tracking_fingerprint, ensure_camera_tracking_state, refresh_camera_tracking_state, set_reid_failure
-from ui.result_adapter import compact_pairs, filtered_tracks_view, format_count, format_ratio, global_id_gallery_view, is_meaningful_reason, merged_global_gallery_view, metric_status, tracking_view
+from ui.result_adapter import compact_pairs, filtered_tracks_view, format_count, format_ratio, global_id_gallery_view, is_meaningful_reason, merged_global_gallery_view, metric_status, reid_view, tracking_view
 from ui.state import invalidate_for_config_change
+from utils.helpers import save_json
 
 
 def _config(yolo_conf=0.2, threshold=0.8, camera_one=0.2, camera_two=0.3):
@@ -16,6 +20,29 @@ def _config(yolo_conf=0.2, threshold=0.8, camera_one=0.2, camera_two=0.3):
         "tracking": {"yolo_conf": yolo_conf}, "filter": {"min_frames": 2}, "reid": {"cross_threshold": threshold},
         "camera_configs": {"c1": {"tracking": {"yolo_conf": camera_one}, "filter": {}}, "c2": {"tracking": {"yolo_conf": camera_two}, "filter": {}}},
     }
+
+
+def test_three_decimal_widget_uses_precise_step_and_format(monkeypatch):
+    captured = {}
+
+    def number_input(_label, **kwargs):
+        captured.update(kwargs)
+        return 0.385
+
+    monkeypatch.setattr(config_panel.st, "number_input", number_input)
+    values = {"min_avg_conf": 0.2}
+
+    config_panel._number(
+        values,
+        "min_avg_conf",
+        "case_4_multicamera_success",
+        "analysis_filter",
+        "camera_1",
+    )
+
+    assert captured["step"] == 0.001
+    assert captured["format"] == "%.3f"
+    assert values["min_avg_conf"] == 0.385
 
 
 def test_adapter_uses_pipeline_tracking_metrics_key_and_raw_tracks():
@@ -29,6 +56,116 @@ def test_adapter_uses_pipeline_tracking_metrics_key_and_raw_tracks():
     assert view["raw_tracks"] == 2
     assert view["valid_tracks"] == 1
     assert view["metrics"]["precision"] == 0.8
+
+
+def test_adapter_counts_raw_valid_and_filtered_from_distinct_artifacts():
+    raw = pd.DataFrame(
+        {
+            "camera": ["c1", "c1", "c1"],
+            "track_id": [1, 2, 3],
+            "frame": [1, 1, 1],
+        }
+    )
+    valid = raw[raw["track_id"].isin([1, 2])].copy()
+    view = tracking_view(
+        {
+            "raw_tracks_all": raw,
+            "valid_tracks_all": valid,
+            "valid_summary_all": pd.DataFrame(
+                {
+                    "camera": ["c1", "c1", "c1"],
+                    "track_id": [1, 2, 3],
+                    "is_valid": [True, True, False],
+                }
+            ),
+        }
+    )
+    assert view["raw_track_count"] == 3
+    assert view["valid_track_count"] == 2
+    assert view["filtered_track_count"] == 1
+
+
+def test_adapter_does_not_use_valid_summary_as_raw_count_for_legacy_output():
+    view = tracking_view(
+        {
+            "valid_summary_all": pd.DataFrame(
+                {
+                    "camera": ["c1", "c1"],
+                    "track_id": [1, 2],
+                    "is_valid": [True, False],
+                }
+            )
+        }
+    )
+    assert view["raw_track_count"] is None
+    assert view["valid_track_count"] == 1
+    assert view["filtered_track_count"] is None
+    assert format_count(view["raw_track_count"]) == "–"
+
+
+def test_pairwise_rate_prefers_canonical_rate_over_raw_error_count():
+    view = reid_view(
+        {
+            "reid_pairwise_eval_df": pd.DataFrame(
+                [{
+                    "false_merge_count": 3,
+                    "false_split_count": 2,
+                    "false_merge_rate": 0.25,
+                    "false_split_rate": 0.50,
+                }]
+            )
+        }
+    )
+    assert format_ratio(view["false_merge_rate"]) == "0.250"
+    assert format_ratio(view["false_split_rate"]) == "0.500"
+
+
+def test_pairwise_zero_rate_is_displayed_as_zero_not_missing():
+    view = reid_view(
+        {
+            "reid_pairwise_eval_df": pd.DataFrame(
+                [{"false_merge_count": 0, "false_merge_rate": 0.0, "false_split_rate": 0.0}]
+            )
+        }
+    )
+    assert format_ratio(view["false_merge_rate"]) == "0.000"
+    assert format_ratio(view["false_split_rate"]) == "0.000"
+
+
+def test_legacy_pairwise_count_without_denominator_is_not_used_as_rate():
+    view = reid_view(
+        {
+            "reid_pairwise_eval_df": pd.DataFrame(
+                [{"false_merge_count": 2, "false_split_count": 1}]
+            )
+        }
+    )
+    assert view["false_merge_rate"] is None
+    assert view["false_split_rate"] is None
+    assert format_ratio(view["false_merge_rate"]) == "–"
+
+
+def test_legacy_complete_pairwise_confusion_matrix_can_derive_rates():
+    view = reid_view(
+        {
+            "reid_pairwise_eval_df": pd.DataFrame(
+                [{"tp_pair": 3, "fp_pair": 1, "fn_pair": 3}]
+            )
+        }
+    )
+    assert view["false_merge_rate"] == 0.25
+    assert view["false_split_rate"] == 0.50
+
+
+def test_tracking_view_accepts_missing_track_gt_diagnostics_and_missing_gt():
+    view = tracking_view({
+        "raw_tracks_all": pd.DataFrame(),
+        "valid_summary_all": pd.DataFrame(),
+        "valid_tracks_all": pd.DataFrame(),
+        "tracking_standard_metrics_df": pd.DataFrame([{"score_available": False}]),
+    })
+    assert view["track_gt_diagnostics_df"].empty
+    assert not view["gt_available"]
 
 
 def test_metric_formatting_has_integer_counts_and_clear_empty_states():
@@ -66,7 +203,7 @@ def test_only_two_active_configuration_modes_and_one_initial_config():
 
 
 def test_initial_analysis_config_applies_to_all_cases_and_recommendations_remain_per_case():
-    configs = [build_error_analysis_config(case["case_id"]) for case in DEMO_CASES]
+    configs = [build_initial_analysis_config(case["case_id"]) for case in DEMO_CASES]
     assert all(config["camera_configs"] for config in configs)
     assert CASE_RECOMMENDATIONS["case_1_normal_success"] != CASE_RECOMMENDATIONS["case_3_failure_limitation"]
 
@@ -142,7 +279,7 @@ def test_allowed_tuning_imgsz_and_initial_value_are_fixed():
 
 
 def test_imgsz_scope_changes_only_selected_camera():
-    config = build_error_analysis_config("case_4_multicamera_success")
+    config = build_initial_analysis_config("case_4_multicamera_success")
     cameras = list(config["camera_configs"])
     first, second = cameras[:2]
     original_second = config["camera_configs"][second]["tracking"]["imgsz"]
@@ -150,6 +287,18 @@ def test_imgsz_scope_changes_only_selected_camera():
     updated = _apply_scope(config, tracking, config["camera_configs"][first]["filter"], config["reid"], "Kamera tertentu", first)
     assert updated["camera_configs"][first]["tracking"]["imgsz"] == 1280
     assert updated["camera_configs"][second]["tracking"]["imgsz"] == original_second
+
+
+def test_all_camera_scope_updates_top_level_and_each_camera_after_apply():
+    config = build_initial_analysis_config("case_4_multicamera_success")
+    tracking = dict(config["tracking"], yolo_iou=0.61)
+    filtering = dict(config["filter"], min_frames=12)
+    updated = _apply_scope(config, tracking, filtering, config["reid"], "Semua kamera", None)
+    assert updated["tracking"]["yolo_iou"] == 0.61
+    assert updated["filter"]["min_frames"] == 12
+    for camera_config in updated["camera_configs"].values():
+        assert camera_config["tracking"]["yolo_iou"] == 0.61
+        assert camera_config["filter"]["min_frames"] == 12
 
 
 def test_adapter_reads_legacy_mota_fields_without_exposing_them():
@@ -291,3 +440,37 @@ def test_yolo_iou_scope_preserves_other_cameras_until_submit():
     assert updated["camera_configs"]["c1"]["tracking"]["yolo_iou"] == 0.50
     assert updated["camera_configs"]["c2"]["tracking"]["yolo_iou"] == 0.60
     assert updated["camera_configs"]["c2"]["tracking"]["match_thresh"] == config["camera_configs"]["c2"]["tracking"]["match_thresh"]
+
+
+def test_three_decimal_min_avg_conf_is_preserved_from_config_state_to_filter_and_json(tmp_path):
+    assert {"yolo_conf", "yolo_iou", "match_thresh", "min_avg_conf", "cross_threshold", "intra_threshold"}.issubset(THREE_DECIMAL_KEYS)
+    config = build_initial_analysis_config("case_4_multicamera_success")
+    selected_camera = "camera_1"
+    pending_filter = dict(config["camera_configs"][selected_camera]["filter"], min_frames=1, min_crops=1, min_avg_conf=0.385)
+    updated = _apply_scope(
+        config,
+        config["camera_configs"][selected_camera]["tracking"],
+        pending_filter,
+        config["reid"],
+        "Kamera tertentu",
+        selected_camera,
+    )
+    state = {"config": updated}
+    assert state["config"]["camera_configs"][selected_camera]["filter"]["min_avg_conf"] == 0.385
+
+    normalized = normalize_config(state["config"])
+    camera_filter = normalized["camera_configs"][selected_camera]["filter"]
+    assert normalized["filter"]["min_avg_conf"] == 0.20
+    assert camera_filter["min_avg_conf"] == 0.385
+
+    config_path = save_json(normalized, tmp_path / "config_used.json")
+    assert json.loads(config_path.read_text(encoding="utf-8"))["camera_configs"][selected_camera]["filter"]["min_avg_conf"] == 0.385
+
+    tracks = pd.DataFrame([{
+        "camera": selected_camera, "track_id": 1, "track_key": f"{selected_camera}_T1",
+        "frame": 1, "conf": 0.385, "area": 1000, "crop_path": "crop.jpg",
+    }])
+    valid, summary = filter_valid_tracks(tracks, camera_filter)
+    assert summary.iloc[0]["min_avg_conf_used"] == 0.385
+    assert summary.iloc[0]["pass_min_avg_conf"]
+    assert len(valid) == 1

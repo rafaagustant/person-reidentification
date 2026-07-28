@@ -1,14 +1,46 @@
 from __future__ import annotations
 
 from pathlib import Path
-import streamlit as st
 import pandas as pd
+import streamlit as st
 
-from core.video_io import make_preview_grid
-try:
-    from config.gt_cases import GT_CASE_META
-except Exception:
-    GT_CASE_META = {}
+
+def _truthy(value) -> bool:
+    return value is True or str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _source_frame_range(row: pd.Series) -> str:
+    first, last = row.get("first_source_frame"), row.get("last_source_frame")
+    if pd.isna(first) or pd.isna(last):
+        return "Tidak tersedia"
+    return str(int(first)) if int(first) == int(last) else f"{int(first)}–{int(last)}"
+
+
+def _ratio_label(value) -> str:
+    return "Tidak tersedia" if value is None or pd.isna(value) else f"{float(value):.0%}"
+
+
+def _decimal_label(value) -> str:
+    return "Tidak tersedia" if value is None or pd.isna(value) else f"{float(value):.3f}"
+
+
+def _text_label(value, fallback: str = "-") -> str:
+    return fallback if value is None or pd.isna(value) or str(value).strip() == "" else str(value)
+
+
+def _main_unmatched_reason(row: pd.Series) -> str:
+    reasons = [
+        ("gt_claimed_by_other_count", "GT sudah dipasangkan dengan track lain"),
+        ("below_iou_threshold_count", "IoU terbaik berada di bawah threshold"),
+        ("no_gt_on_frame_count", "Tidak ada GT pada frame"),
+        ("unknown_unmatched_count", "Penyebab tidak dapat diklasifikasikan"),
+    ]
+    counts = [
+        (0 if pd.isna(row.get(column, 0)) else int(row.get(column, 0)), label)
+        for column, label in reasons
+    ]
+    count, label = max(counts, default=(0, ""))
+    return f"Alasan utama: {label} pada {count} prediksi." if count else "Alasan utama: tidak ada prediksi unmatched."
 
 
 def widget_key(case_id: str, section: str, name: str, camera: str | None = None) -> str:
@@ -16,83 +48,6 @@ def widget_key(case_id: str, section: str, name: str, camera: str | None = None)
     if camera:
         parts.append(camera)
     return "__".join(str(part).replace(" ", "_") for part in parts)
-
-
-def hero():
-    st.title("Person Re-Identification Multi-Kamera")
-    st.caption("YOLO11n + BoT-SORT + OSNet untuk pembentukan Global ID dan evaluasi ground truth.")
-
-
-def case_info(case: dict):
-    st.subheader(case["title"])
-    st.write(case.get("description", ""))
-    gt_meta = GT_CASE_META.get(case.get("case_id"), {})
-    rec_text = case.get("recommended_config", "Recommended config final")
-
-    cols = st.columns(5)
-    cols[0].metric("Jumlah kamera", len(case.get("cameras", [])))
-    cols[1].metric("Kamera", ", ".join(case.get("cameras", [])))
-    cols[2].metric("Skenario", case.get("scene_type", "-"))
-    cols[3].metric("Frame GT", f"{gt_meta.get('source_frame_start', '-')}-{gt_meta.get('source_frame_end', '-')}")
-    cols[4].metric("Rekomendasi case", rec_text)
-    if case.get("expected_result"):
-        st.info(case.get("expected_result", ""))
-
-
-def asset_status(case: dict):
-    rows = []
-    for cam in case["cameras"]:
-        video_path = Path(case["video_files"][cam])
-        gt_meta = GT_CASE_META.get(case.get("case_id"), {})
-        annotation_dir = Path(gt_meta.get("annotation_dir", "")) if gt_meta.get("annotation_dir") else None
-        rows.append({
-            "camera": cam,
-            "video_path": str(video_path),
-            "video_exists": video_path.exists(),
-            "annotation_dir": str(annotation_dir) if annotation_dir else "",
-            "annotation_exists": bool(annotation_dir and annotation_dir.exists()),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-
-
-def preview_videos(case: dict):
-    frame_idx = st.slider("Preview frame lokal", min_value=0, max_value=2000, value=0, step=1, key=f"preview_{case['case_id']}")
-    grid = make_preview_grid(case["video_files"], frame_idx=frame_idx)
-    if grid is not None:
-        st.image(grid, channels="BGR", use_container_width=True)
-
-
-def show_gallery(gallery_df: pd.DataFrame, title: str):
-    st.subheader(title)
-    if gallery_df is None or len(gallery_df) == 0:
-        st.info("Gallery belum tersedia.")
-        return
-    cols = st.columns(4)
-    for i, (_, row) in enumerate(gallery_df.iterrows()):
-        path = Path(row["image_path"])
-        with cols[i % 4]:
-            if path.exists():
-                st.image(str(path), use_container_width=True)
-            label = row.get("global_id", row.get("track_key", ""))
-            st.caption(str(label))
-
-
-def download_table(df, label: str, filename: str, key: str | None = None):
-    if df is None or len(df) == 0:
-        return
-
-    if key is None:
-        safe_label = str(label).replace(" ", "_").replace(".", "_").replace("/", "_").replace("\\", "_")
-        safe_filename = str(filename).replace(" ", "_").replace(".", "_").replace("/", "_").replace("\\", "_")
-        key = f"download_{safe_label}_{safe_filename}_{id(df)}"
-
-    st.download_button(
-        label=label,
-        data=df.to_csv(index=False).encode("utf-8"),
-        file_name=filename,
-        mime="text/csv",
-        key=key,
-    )
 
 
 def dataframe_tools(df: pd.DataFrame, filename: str, key: str) -> None:
@@ -104,6 +59,18 @@ def dataframe_tools(df: pd.DataFrame, filename: str, key: str) -> None:
         st.code(csv_data, language="csv")
         st.code(tsv_data, language="text")
         st.download_button("Unduh CSV", csv_data.encode("utf-8"), file_name=filename, mime="text/csv", key=f"{key}_csv")
+
+
+def dataframe_with_tools(
+    df: pd.DataFrame,
+    filename: str,
+    key: str,
+    *,
+    hide_index: bool = True,
+) -> None:
+    """Tampilkan tabel beserta CSV dan TSV yang dapat disalin."""
+    st.dataframe(df, hide_index=hide_index, key=f"{key}__table")
+    dataframe_tools(df, filename, key)
 
 
 def filtered_track_gallery(tracks_df: pd.DataFrame) -> None:
@@ -119,7 +86,8 @@ def filtered_track_gallery(tracks_df: pd.DataFrame) -> None:
                 st.caption("Crop tidak tersedia")
             st.caption(
                 f"{row.get('camera', '-')} | local track {row.get('track_id', '-')}\n\n"
-                f"Frame: {row.get('num_frames', '-')} | Crop: {row.get('num_crops', '-')}\n\n"
+                f"Frame: {row.get('num_frames', '-')} | Rentang: {_source_frame_range(row)} | Continuity: {_ratio_label(row.get('continuity_ratio'))}\n\n"
+                f"Crop: {row.get('num_crops', '-')}\n\n"
                 f"Avg conf: {row.get('avg_conf', '-')} | Avg area: {row.get('avg_area', '-')}"
             )
             st.caption(f"Alasan filter: {row.get('filter_reasons', '-')}")
@@ -239,5 +207,27 @@ def crop_gallery(gallery_df: pd.DataFrame, title: str, key: str) -> None:
                 st.image(str(image_path), width="stretch")
             else:
                 st.caption("Crop tidak tersedia")
+            track_key = str(row.get("track_key", "Track"))
+            st.markdown(f"**{track_key}**")
+            st.caption(
+                f"Frame: {row.get('num_frames', '-')} | Rentang: {_source_frame_range(row)} | Continuity: {_ratio_label(row.get('continuity_ratio'))}\n\n"
+                f"Avg conf: {row.get('avg_conf', '-')} | Avg area: {row.get('avg_area', '-')}\n\n"
+                f"Status: {row.get('status', 'Valid')}"
+            )
+            st.caption(f"Alasan filter: {_text_label(row.get('filter_reason'))}")
+            if _truthy(row.get("evaluation_included")):
+                st.caption(f"Evaluasi GT\n\nMatched: {row.get('matched_frame_count', 0)} | Unmatched: {row.get('unmatched_frame_count', 0)} | Match rate: {_ratio_label(row.get('match_rate'))}")
+                st.caption(_main_unmatched_reason(row))
+                with st.expander(f"Detail Diagnosis GT — {track_key}"):
+                    st.caption(
+                        f"no_gt_on_frame: {row.get('no_gt_on_frame_count', 0)}\n\n"
+                        f"below_iou_threshold: {row.get('below_iou_threshold_count', 0)}\n\n"
+                        f"gt_claimed_by_other_prediction: {row.get('gt_claimed_by_other_count', 0)}\n\n"
+                        f"unknown: {row.get('unknown_unmatched_count', 0)}\n\n"
+                        f"Candidate GT ID: {row.get('candidate_gt_id', '-')}\n\n"
+                        f"Best IoU mean/max: {_decimal_label(row.get('best_iou_mean'))} / {_decimal_label(row.get('best_iou_max'))}\n\n"
+                        f"GT diklaim track: {row.get('claimed_by_track_key', '-')} ({row.get('claimed_by_frame_count', 0)} frame)\n\n"
+                        f"IoU threshold: {_decimal_label(row.get('iou_threshold_used'))}"
+                    )
             labels = [str(row.get(name)) for name in ["global_id", "track_key", "camera", "track_id"] if name in row and pd.notna(row.get(name))]
             st.caption(" · ".join(labels))

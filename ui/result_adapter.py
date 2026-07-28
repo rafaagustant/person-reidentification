@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pandas as pd
@@ -137,8 +136,9 @@ def compact_pairs(pairs: pd.DataFrame, threshold: float) -> pd.DataFrame:
     out = pairs.copy()
     if not len(out):
         return out
-    out["threshold"] = threshold
-    out["similarity_margin"] = (out["cosine_similarity"] - threshold).abs()
+    if "threshold" not in out:
+        out["threshold"] = threshold
+    out["similarity_margin"] = out.get("similarity_margin", out["cosine_similarity"] - out["threshold"])
     for suffix in ("a", "b"):
         start_column = f"start_source_frame_{suffix}"
         end_column = f"end_source_frame_{suffix}"
@@ -164,7 +164,8 @@ def compact_pairs(pairs: pd.DataFrame, threshold: float) -> pd.DataFrame:
     out.loc[~has_source_temporal, "temporal_gap"] = pd.NA
     out.loc[~has_source_temporal, "temporal_status"] = "Tidak tersedia"
     out = out.drop(columns=["overlap_ratio"], errors="ignore")
-    out["association_type"] = out["same_camera"].map({True: "intra_camera", False: "cross_camera"}) if "same_camera" in out else ""
+    if "association_type" not in out:
+        out["association_type"] = out["same_camera"].map({True: "intra_camera", False: "cross_camera"}) if "same_camera" in out else ""
     mnn_labels = {
         "passed": "Diterima",
         "failed": "Ditolak",
@@ -182,7 +183,7 @@ def compact_pairs(pairs: pd.DataFrame, threshold: float) -> pd.DataFrame:
         out["mnn_status"] = "Tidak tersedia"
     merge_status = out["merge_status"] if "merge_status" in out else pd.Series(False, index=out.index)
     out["decision"] = merge_status.map({True: "Diterima", False: "Ditolak"})
-    reason = out.get("merge_reason", pd.Series("", index=out.index)).where(~merge_status, "")
+    reason = out.get("rejection_reason", out.get("merge_reason", pd.Series("", index=out.index))).where(~merge_status, "")
     out["rejection_reason"] = reason.where(reason.map(is_meaningful_reason), "")
     return out
 
@@ -207,11 +208,38 @@ def first_row(frame: pd.DataFrame) -> dict[str, Any]:
 def count_tracks(frame: pd.DataFrame) -> int:
     if len(frame) == 0:
         return 0
+    if {"camera", "track_id"}.issubset(frame.columns):
+        return int(frame[["camera", "track_id"]].dropna().drop_duplicates().shape[0])
     if "track_key" in frame:
         return int(frame["track_key"].dropna().nunique())
-    if {"camera", "track_id"}.issubset(frame.columns):
-        return int(frame[["camera", "track_id"]].drop_duplicates().shape[0])
     return 0
+
+
+def _canonical_count(result: dict | None, key: str) -> int | None:
+    value = (result or {}).get(key)
+    if value is None or pd.isna(value):
+        return None
+    value = int(value)
+    return value if value >= 0 else None
+
+
+def _pairwise_rate(metrics: dict[str, Any], key: str) -> float | None:
+    value = metrics.get(key)
+    if value is not None and not pd.isna(value):
+        rate = float(value)
+        return rate if 0.0 <= rate <= 1.0 else None
+
+    # Compatibility fallback for old outputs that have the complete pairwise
+    # confusion matrix but do not yet persist the canonical rate fields.
+    if not {"tp_pair", "fp_pair", "fn_pair"}.issubset(metrics):
+        return None
+    tp = int(metrics["tp_pair"] or 0)
+    if key == "false_merge_rate":
+        numerator = int(metrics["fp_pair"] or 0)
+    else:
+        numerator = int(metrics["fn_pair"] or 0)
+    denominator = tp + numerator
+    return numerator / denominator if denominator > 0 else None
 
 
 def metric_status(value: Any, *, gt_available: bool = True, applicable: bool = True) -> str:
@@ -227,13 +255,15 @@ def metric_status(value: Any, *, gt_available: bool = True, applicable: bool = T
 def format_count(value: Any, status: str = "") -> str:
     if status:
         return status
+    if value is None or pd.isna(value):
+        return "–"
     return str(int(value or 0))
 
 
 def format_ratio(value: Any, status: str = "") -> str:
     if status:
         return status
-    return f"{float(value):.3f}" if value is not None and not pd.isna(value) else "Data kosong"
+    return f"{float(value):.3f}" if value is not None and not pd.isna(value) else "–"
 
 
 def tracking_view(result: dict | None) -> dict[str, Any]:
@@ -244,20 +274,70 @@ def tracking_view(result: dict | None) -> dict[str, Any]:
     if "mota" not in metrics:
         metrics["mota"] = metrics.get("raw_mota_simple", metrics.get("mota_simple"))
     gt_available = bool(metrics.get("score_available", False))
-    valid = count_tracks(valid_summary) or count_tracks(valid_tracks)
+    raw_count = _canonical_count(result, "raw_track_count")
+    if raw_count is None and isinstance((result or {}).get("raw_tracks_all"), pd.DataFrame):
+        raw_count = count_tracks(raw)
+
+    valid_count = _canonical_count(result, "valid_track_count")
+    if valid_count is None and isinstance((result or {}).get("valid_tracks_all"), pd.DataFrame):
+        valid_count = count_tracks(valid_tracks)
+    elif valid_count is None and len(valid_summary):
+        if "is_valid" in valid_summary:
+            valid_mask = valid_summary["is_valid"].astype(str).str.lower().isin(["true", "1", "yes", "valid"])
+            valid_count = count_tracks(valid_summary[valid_mask])
+        else:
+            # Older contracts used valid_summary_all for valid-only rows.
+            valid_count = count_tracks(valid_summary)
+
+    filtered_count = _canonical_count(result, "filtered_track_count")
+    if raw_count is not None and valid_count is not None:
+        if valid_count <= raw_count:
+            filtered_count = raw_count - valid_count
+        else:
+            valid_count = None
+            filtered_count = None
+
     standard_by_camera = dataframe(result, "tracking_standard_metrics_by_camera_df")
+    track_diagnostics = dataframe(result, "track_gt_diagnostics_df")
+    local_gallery = dataframe(result, "local_gallery_df")
+    if len(local_gallery) and len(valid_summary) and "track_key" in local_gallery and "track_key" in valid_summary:
+        local_gallery = local_gallery.merge(
+            valid_summary[[column for column in ["track_key", "status", "filter_reason"] if column in valid_summary]],
+            on="track_key",
+            how="left",
+        )
+    if len(local_gallery) and len(track_diagnostics) and "track_key" in local_gallery and "track_key" in track_diagnostics:
+        diagnostic_columns = [
+            "track_key", "first_source_frame", "last_source_frame", "continuity_ratio",
+            "evaluation_included", "matched_frame_count", "unmatched_frame_count", "match_rate",
+            "no_gt_on_frame_count", "below_iou_threshold_count", "gt_claimed_by_other_count",
+            "unknown_unmatched_count", "candidate_gt_id", "best_iou_mean", "best_iou_max",
+            "claimed_by_track_key", "claimed_by_frame_count", "iou_threshold_used",
+        ]
+        local_gallery = local_gallery.merge(
+            track_diagnostics[[column for column in diagnostic_columns if column in track_diagnostics]],
+            on="track_key",
+            how="left",
+        )
     if len(standard_by_camera) and "mota" not in standard_by_camera:
         for legacy_key in ("raw_mota_simple", "mota_simple"):
             if legacy_key in standard_by_camera:
                 standard_by_camera["mota"] = standard_by_camera[legacy_key]
                 break
     return {
-        "raw_tracks": count_tracks(raw), "valid_tracks": valid, "raw_tracks_df": raw,
+        "raw_track_count": raw_count,
+        "valid_track_count": valid_count,
+        "filtered_track_count": filtered_count,
+        # Compatibility aliases retained for existing UI/manifest consumers.
+        "raw_tracks": raw_count,
+        "valid_tracks": valid_count,
+        "raw_tracks_df": raw,
         "valid_summary_df": valid_summary, "valid_tracks_df": valid_tracks, "metrics": metrics,
         "gt_available": gt_available, "camera_status_df": dataframe(result, "camera_status_df"),
         "standard_by_camera_df": standard_by_camera,
-        "score_by_camera_df": dataframe(result, "tracking_score_by_camera_df"),
-        "local_gallery_df": dataframe(result, "local_gallery_df"),
+        "track_count_by_camera_df": dataframe(result, "track_count_by_camera_df"),
+        "local_gallery_df": local_gallery,
+        "track_gt_diagnostics_df": track_diagnostics,
         "temporal_coverage_df": dataframe(result, "gt_temporal_coverage_df"),
         "temporal_coverage_summary_df": dataframe(result, "gt_temporal_coverage_summary_df"),
         "matched_df": dataframe(result, "matched_df"),
@@ -268,6 +348,8 @@ def tracking_view(result: dict | None) -> dict[str, Any]:
 def reid_view(result: dict | None) -> dict[str, Any]:
     raw_pairs = dataframe(result, "pair_df")
     metrics = first_row(dataframe(result, "reid_pairwise_eval_df"))
+    false_merge_rate = _pairwise_rate(metrics, "false_merge_rate")
+    false_split_rate = _pairwise_rate(metrics, "false_split_rate")
     meta = dataframe(result, "global_meta_df")
     merged_groups, merged_members = merged_global_gallery_view(meta)
     global_cards = global_id_gallery_view(meta, dataframe(result, "global_gallery_df"))
@@ -280,6 +362,8 @@ def reid_view(result: dict | None) -> dict[str, Any]:
     return {
         "global_ids": int(meta["global_id"].nunique()) if "global_id" in meta else 0,
         "merged_pairs": int(raw_pairs["merge_status"].sum()) if "merge_status" in raw_pairs else 0,
+        "false_merge_rate": false_merge_rate,
+        "false_split_rate": false_split_rate,
         "metrics": metrics, "pairs_df": compact, "raw_pairs_df": raw_pairs, "compact_pairs_df": compact, "global_meta_df": global_id_display_view(meta),
         "gallery_df": dataframe(result, "global_gallery_df"),
         "global_id_gallery_cards_df": global_cards,
@@ -298,6 +382,9 @@ def manifest_metrics(tracking_result: dict | None, reid_result: dict | None) -> 
     reid = reid_view(reid_result)
     return {
         "tracking_metrics": tracking["metrics"], "global_id_metrics": reid["metrics"],
+        "raw_track_count": tracking["raw_track_count"],
+        "valid_track_count": tracking["valid_track_count"],
+        "filtered_track_count": tracking["filtered_track_count"],
         "raw_tracks": tracking["raw_tracks"], "valid_tracks": tracking["valid_tracks"],
         "global_ids": reid["global_ids"], "merged_pairs": reid["merged_pairs"],
     }

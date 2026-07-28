@@ -34,16 +34,7 @@ def build_sampled_track_crop_df(
         camera = str(g["camera"].iloc[0])
         camera_filter = ((camera_configs or {}).get(camera) or {}).get("filter") or filter_cfg
         max_samples = int(camera_filter.get("max_samples_per_track", 48))
-        strategy = str(camera_filter.get("crop_selection_strategy", "quality"))
-        if strategy == "uniform":
-            g = g.sort_values("frame")
-            if len(g) > max_samples:
-                idx = np.linspace(0, len(g) - 1, max_samples).round().astype(int)
-                chosen = g.iloc[idx]
-            else:
-                chosen = g
-        else:
-            chosen = g.sort_values("quality_score", ascending=False).head(max_samples).sort_values("frame")
+        chosen = g.sort_values("quality_score", ascending=False).head(max_samples).sort_values("frame")
         rows.append(chosen)
 
     sampled = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
@@ -81,7 +72,7 @@ def build_embedding_manifest(
         "valid_track_fingerprint": _fingerprint(valid_df[valid_columns].to_dict("records") if valid_columns else []),
         "selected_crop_fingerprint": _fingerprint(selected[selected_columns].to_dict("records") if selected_columns else []),
         "max_samples_per_track": sorted(set(selected.groupby("track_key").size().tolist())) if len(selected) else [],
-        "crop_selection_strategy": "per_camera_config",
+        "crop_selection_method": "quality_score",
         "preprocessing": {"resize": [256, 128], "normalize_mean": [0.485, 0.456, 0.406], "normalize_std": [0.229, 0.224, 0.225]},
     }
 

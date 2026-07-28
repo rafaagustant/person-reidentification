@@ -5,8 +5,8 @@ import copy
 import pandas as pd
 import streamlit as st
 
-from config.presets import build_config_from_case_recommendation, build_error_analysis_config, normalize_config
-from ui.components import widget_key
+from config.presets import build_initial_analysis_config, build_recommended_config, normalize_config
+from ui.components import dataframe_with_tools, widget_key
 from ui.state import invalidate_for_config_change
 
 
@@ -17,22 +17,27 @@ PARAMETER_HELP = {
     "match_thresh": "Ambang pencocokan deteksi dengan track pada BoT-SORT.", "track_buffer": "Jumlah frame untuk mempertahankan track yang hilang sementara.",
     "min_frames": "Jumlah minimum frame agar local track dinyatakan valid.", "min_crops": "Jumlah minimum crop agar local track dinyatakan valid.",
     "min_avg_conf": "Rata-rata confidence minimum pada local track.", "min_avg_area": "Rata-rata luas bounding box minimum pada local track.",
-    "max_samples_per_track": "Jumlah maksimum crop yang digunakan untuk membentuk embedding track.", "crop_selection_strategy": "Strategi pemilihan crop representatif dari setiap local track.",
+    "max_samples_per_track": "Jumlah maksimum crop yang digunakan untuk membentuk embedding track.",
     "enable_cross_camera": "Mengaktifkan asosiasi lintas kamera.", "enable_strict_intra": "Mengaktifkan pemulihan fragmentasi dalam kamera.", "use_mnn": "Mengaktifkan mutual nearest neighbour pada asosiasi lintas kamera.",
     "cross_threshold": "Ambang cosine similarity untuk asosiasi lintas kamera.", "intra_threshold": "Ambang cosine similarity untuk pemulihan fragmentasi dalam kamera.",
     "intra_max_gap": "Jeda frame maksimum untuk asosiasi intra-camera.", "intra_max_overlap": "Tumpang tindih frame maksimum yang masih diperbolehkan.",
 }
 
 TRACKING_KEYS = ["yolo_conf", "yolo_iou", "imgsz", "track_high_thresh", "track_low_thresh", "new_track_thresh", "match_thresh", "track_buffer"]
-FILTER_KEYS = ["min_frames", "min_crops", "min_avg_conf", "min_avg_area", "max_samples_per_track", "crop_selection_strategy"]
+FILTER_KEYS = ["min_frames", "min_crops", "min_avg_conf", "min_avg_area", "max_samples_per_track"]
 REID_KEYS = ["enable_cross_camera", "enable_strict_intra", "use_mnn", "cross_threshold", "intra_threshold", "intra_max_gap", "intra_max_overlap"]
 ALLOWED_TUNING_IMGSZ = [640, 960, 1280]
+THREE_DECIMAL_KEYS = {
+    "yolo_conf", "yolo_iou", "track_high_thresh", "track_low_thresh",
+    "new_track_thresh", "match_thresh", "min_avg_conf", "cross_threshold",
+    "intra_threshold",
+}
 
 
 def configuration_for_mode(case_id: str, mode: str) -> dict:
-    config = build_config_from_case_recommendation(case_id) if mode == "Konfigurasi Rekomendasi" else build_error_analysis_config(case_id)
-    config["config_mode"] = "case_recommendation" if mode == "Konfigurasi Rekomendasi" else "initial_analysis"
-    return normalize_config(config)
+    if mode == "Konfigurasi Rekomendasi":
+        return build_recommended_config(case_id)
+    return build_initial_analysis_config(case_id)
 
 
 def _parameter_table(values: dict, keys: list[str]) -> pd.DataFrame:
@@ -49,12 +54,12 @@ def _recommended_view(case_id: str, config: dict) -> None:
             left, right = st.columns(2)
             with left:
                 st.markdown("**Deteksi dan Tracking**")
-                st.dataframe(_parameter_table(camera_config.get("tracking", {}), TRACKING_KEYS), hide_index=True, key=widget_key(case_id, "recommendation", "tracking_table", camera))
+                dataframe_with_tools(_parameter_table(camera_config.get("tracking", {}), TRACKING_KEYS), f"{case_id}_{camera}_tracking_config.csv", widget_key(case_id, "recommendation", "tracking_table", camera))
             with right:
                 st.markdown("**Penyaringan Track**")
-                st.dataframe(_parameter_table(camera_config.get("filter", {}), FILTER_KEYS), hide_index=True, key=widget_key(case_id, "recommendation", "filter_table", camera))
+                dataframe_with_tools(_parameter_table(camera_config.get("filter", {}), FILTER_KEYS), f"{case_id}_{camera}_filter_config.csv", widget_key(case_id, "recommendation", "filter_table", camera))
     st.markdown("**Asosiasi Re-ID**")
-    st.dataframe(_parameter_table(config.get("reid", {}), REID_KEYS), hide_index=True, key=widget_key(case_id, "recommendation", "reid_table"))
+    dataframe_with_tools(_parameter_table(config.get("reid", {}), REID_KEYS), f"{case_id}_reid_config.csv", widget_key(case_id, "recommendation", "reid_table"))
 
 
 def _number(
@@ -78,7 +83,7 @@ def _number(
         min_value = float(minimum)
         max_value = float(maximum)
         input_value = float(value)
-        step = 0.01
+        step = 0.001 if name in THREE_DECIMAL_KEYS else 0.01
 
     config[name] = st.number_input(
         f"`{name}`",
@@ -86,6 +91,7 @@ def _number(
         max_value=max_value,
         value=input_value,
         step=step,
+        format="%.3f" if name in THREE_DECIMAL_KEYS else None,
         help=PARAMETER_HELP[name],
         key=widget_key(case_id, section, name, camera),
     )
@@ -118,7 +124,6 @@ def _controls(case_id: str, camera: str | None, tracking: dict, filtering: dict,
         with second:
             _number(filtering, "min_avg_area", case_id, "analysis_filter", camera, minimum=0, maximum=10000000)
             _number(filtering, "max_samples_per_track", case_id, "analysis_filter", camera, integer=True, minimum=1, maximum=256)
-            filtering["crop_selection_strategy"] = st.selectbox("`crop_selection_strategy`", ["quality", "uniform"], index=["quality", "uniform"].index(filtering["crop_selection_strategy"]), help=PARAMETER_HELP["crop_selection_strategy"], key=widget_key(case_id, "analysis_filter", "crop_selection_strategy", camera))
     with st.expander("Asosiasi Re-ID"):
         left, right = st.columns(2)
         with left:
@@ -135,6 +140,9 @@ def _controls(case_id: str, camera: str | None, tracking: dict, filtering: dict,
 def _apply_scope(config: dict, tracking: dict, filtering: dict, reid: dict, scope: str, camera: str | None) -> dict:
     updated = copy.deepcopy(config)
     targets = list(updated.get("camera_configs", {})) if scope == "Semua kamera" else [camera]
+    if scope == "Semua kamera":
+        updated["tracking"] = copy.deepcopy(tracking)
+        updated["filter"] = copy.deepcopy(filtering)
     for target in targets:
         if target:
             updated["camera_configs"][target]["tracking"] = copy.deepcopy(tracking)

@@ -16,6 +16,7 @@ from core.paths import OSNET_DEFAULT_PATH, YOLO_LOCAL_PATH
 from core.pipeline import create_run_dir, render_reid_outputs, run_reid_stage, run_tracking_stage
 from config.presets import normalize_config
 from ui.config_panel import render_config_panel
+from ui.components import dataframe_with_tools
 from ui.results_panel import render_results
 from ui.result_adapter import manifest_metrics
 from ui.state import (
@@ -46,7 +47,7 @@ def _case_overview(case: dict) -> None:
         st.metric("Kamera", len(case["cameras"]), border=True)
         st.metric("Rentang frame", f"{case.get('source_frame_start', '-')}-{case.get('source_frame_end', '-')}", border=True)
         st.metric("ID ground truth", case.get("gt_identity", "N/A"), border=True)
-    st.dataframe(_asset_rows(case), hide_index=True)
+    dataframe_with_tools(_asset_rows(case), f"{case['case_id']}_asset_status.csv", f"{case['case_id']}__case_overview__assets")
 
 
 def _save_camera_manifest(state: dict, case: dict) -> None:
@@ -228,7 +229,7 @@ def _case_page(case: dict, cuda_active: bool, yolo_weight: str, osnet_weight: st
     is_multi = len(case["cameras"]) > 1
     if is_multi:
         st.markdown("**Tracking per Kamera**")
-        st.dataframe(_camera_tracking_table(case, state), hide_index=True)
+        dataframe_with_tools(_camera_tracking_table(case, state), f"{case['case_id']}_camera_tracking_status.csv", f"{case['case_id']}__tracking_process__status")
         selected_camera = st.selectbox("Kamera yang Dijalankan", case["cameras"], key=f"{case['case_id']}__tracking_process__selected_camera")
         left, right = st.columns(2)
         if left.button("Jalankan Kamera Terpilih", type="primary", icon=":material/videocam:", key=f"{case['case_id']}__tracking_process__run_selected_camera"):

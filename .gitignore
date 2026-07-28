@@ -12,9 +12,12 @@ ENV/
 !.env.example
 
 .pytest_cache/
+.pytest_tmp*/
 .mypy_cache/
 .ruff_cache/
 .streamlit/secrets.toml
+.idea/
+.vscode/
 
 .agents/
 
@@ -39,13 +42,18 @@ assets/cases/**/*.mkv
 *.pt
 *.pth
 *.onnx
+*.engine
+*.npy
+*.npz
+*.pkl
+*.pickle
 *.log
 *.tmp
 *.bak
+generated_tracker_config_used.yaml
+tracking_runtime_manifest.yaml
 
 .DS_Store
 Thumbs.db
 formula.md
 output_data_lengkap.md
-
-.pytest_tmp/

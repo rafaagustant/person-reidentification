@@ -109,7 +109,7 @@ def save_tracking_runtime_manifest(
             "persist": True,
             "device": device,
         },
-        "tracking_config": {
+        "tracking": {
             "yolo_conf": float(config.get("yolo_conf", 0.25)),
             "yolo_iou": float(config.get("yolo_iou", 0.50)),
             "imgsz": int(config.get("imgsz", 640)),
@@ -138,6 +138,83 @@ def reset_yolo_tracker(model) -> None:
 
 def empty_track_df() -> pd.DataFrame:
     return pd.DataFrame(columns=TRACK_COLUMNS)
+
+
+def count_unique_tracks(track_df: pd.DataFrame | None) -> int:
+    """Count local tracks by the canonical (camera, track_id) identity."""
+    if track_df is None or len(track_df) == 0:
+        return 0
+    if {"camera", "track_id"}.issubset(track_df.columns):
+        return int(
+            track_df[["camera", "track_id"]]
+            .dropna()
+            .drop_duplicates()
+            .shape[0]
+        )
+    if "track_key" in track_df.columns:
+        # Compatibility only for older artifacts without camera/track_id.
+        return int(track_df["track_key"].dropna().nunique())
+    return 0
+
+
+def build_track_count_summary(
+    raw_tracks_df: pd.DataFrame | None,
+    valid_tracks_df: pd.DataFrame | None,
+    cameras: list[str] | tuple[str, ...] | None = None,
+) -> dict:
+    """Build invariant-checked raw, valid, and filtered local-track counts."""
+    raw = raw_tracks_df if isinstance(raw_tracks_df, pd.DataFrame) else pd.DataFrame()
+    valid = valid_tracks_df if isinstance(valid_tracks_df, pd.DataFrame) else pd.DataFrame()
+
+    raw_count = count_unique_tracks(raw)
+    valid_count = count_unique_tracks(valid)
+    if valid_count > raw_count:
+        raise ValueError(
+            f"Valid track count ({valid_count}) cannot exceed raw track count ({raw_count})."
+        )
+
+    camera_names = list(cameras or [])
+    if not camera_names:
+        values = []
+        for frame in (raw, valid):
+            if "camera" in frame.columns:
+                values.extend(frame["camera"].dropna().astype(str).unique().tolist())
+        camera_names = sorted(set(values))
+
+    rows = []
+    for camera in camera_names:
+        raw_camera = raw[raw["camera"].astype(str) == str(camera)] if "camera" in raw else pd.DataFrame()
+        valid_camera = valid[valid["camera"].astype(str) == str(camera)] if "camera" in valid else pd.DataFrame()
+        raw_camera_count = count_unique_tracks(raw_camera)
+        valid_camera_count = count_unique_tracks(valid_camera)
+        if valid_camera_count > raw_camera_count:
+            raise ValueError(
+                f"Valid track count for {camera} ({valid_camera_count}) "
+                f"cannot exceed raw track count ({raw_camera_count})."
+            )
+        rows.append(
+            {
+                "camera": str(camera),
+                "raw_track_count": raw_camera_count,
+                "valid_track_count": valid_camera_count,
+                "filtered_track_count": raw_camera_count - valid_camera_count,
+            }
+        )
+
+    return {
+        "raw_track_count": raw_count,
+        "valid_track_count": valid_count,
+        "filtered_track_count": raw_count - valid_count,
+        "by_camera_df": pd.DataFrame(
+            rows,
+            columns=[
+                "camera",
+                "raw_track_count",
+                "valid_track_count",
+                "filtered_track_count",
+            ],
+        ),
+    }
 
 
 def safe_progress(progress_callback, camera: str, done: int, total: int) -> None:
@@ -321,6 +398,11 @@ def summarize_tracks(track_df: pd.DataFrame) -> pd.DataFrame:
     for track_key, group in track_df.groupby("track_key"):
         rep = group.sort_values(["area", "conf"], ascending=False).iloc[0]
         num_crops = int(group["crop_path"].fillna("").astype(str).ne("").sum()) if "crop_path" in group else 0
+        source_frames = sorted({int(value) for value in group.get("source_frame", pd.Series(dtype=float)).dropna()})
+        first_source = source_frames[0] if source_frames else None
+        last_source = source_frames[-1] if source_frames else None
+        observed = len(source_frames)
+        frame_span = last_source - first_source + 1 if first_source is not None and last_source is not None else 0
 
         rows.append(
             {
@@ -333,6 +415,10 @@ def summarize_tracks(track_df: pd.DataFrame) -> pd.DataFrame:
                 "avg_area": float(group["area"].mean()),
                 "first_frame": int(group["frame"].min()),
                 "last_frame": int(group["frame"].max()),
+                "first_source_frame": first_source,
+                "last_source_frame": last_source,
+                "observed_frame_count": observed,
+                "continuity_ratio": observed / frame_span if frame_span else None,
                 "representative_crop": rep.get("crop_path", ""),
             }
         )
