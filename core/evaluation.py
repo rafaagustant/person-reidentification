@@ -23,6 +23,14 @@ ID_KEYS = ["person_id", "identity_id", "identity", "gt_id", "track_id", "subject
 BBOX_KEYS = ["BboxP", "bboxP", "bbox", "box", "bounding_box", "rect"]
 LIST_KEYS = ["frames", "annotations", "objects", "people", "persons", "detections", "labels", "items"]
 EMPTY_GT_COLUMNS = ["camera", "source_frame", "gt_id", "x1", "y1", "x2", "y2", "gt_area"]
+TRACK_GT_DIAGNOSTIC_COLUMNS = [
+    "camera", "track_id", "track_key", "first_source_frame", "last_source_frame",
+    "num_frames", "continuity_ratio", "evaluation_included", "matched_frame_count",
+    "unmatched_frame_count", "match_rate", "no_gt_on_frame_count",
+    "below_iou_threshold_count", "gt_claimed_by_other_count",
+    "unknown_unmatched_count", "candidate_gt_id", "best_iou_mean", "best_iou_max",
+    "claimed_by_track_key", "claimed_by_frame_count", "iou_threshold_used",
+]
 
 
 def resolve_path(path_value) -> Path:
@@ -255,6 +263,7 @@ def compute_iou(box_a, box_b) -> float:
 
 
 def match_predictions_to_gt(pred_df: pd.DataFrame, gt_df: pd.DataFrame, iou_threshold=0.50) -> pd.DataFrame:
+    """Match detections to GT once per camera/source frame using deterministic IoU order."""
     pred = pred_df.copy()
     if len(pred) == 0:
         pred["gt_id"] = []
@@ -264,27 +273,138 @@ def match_predictions_to_gt(pred_df: pd.DataFrame, gt_df: pd.DataFrame, iou_thre
     pred["gt_id"] = -1
     pred["gt_iou"] = 0.0
     pred["is_matched"] = False
+    pred["match_status"] = "unknown"
+    pred["candidate_gt_id"] = pd.NA
+    pred["best_gt_iou"] = pd.NA
+    pred["claimed_by_track_key"] = pd.NA
     if gt_df is None or len(gt_df) == 0 or "source_frame" not in pred.columns:
         return pred
-    gt_groups = {k: g for k, g in gt_df.groupby(["camera", "source_frame"])}
-    for idx, row in pred.iterrows():
-        key = (row["camera"], int(row["source_frame"]))
-        g = gt_groups.get(key)
-        if g is None or len(g) == 0:
+    gt_groups = {key: group for key, group in gt_df.groupby(["camera", "source_frame"], sort=True)}
+    for key, prediction_group in pred.groupby(["camera", "source_frame"], sort=True):
+        gt_group = gt_groups.get(key)
+        if gt_group is None or len(gt_group) == 0:
+            pred.loc[prediction_group.index, "match_status"] = "no_gt_on_frame"
             continue
-        pbox = [row["x1"], row["y1"], row["x2"], row["y2"]]
-        best_iou = 0.0
-        best_gt = -1
-        for _, gt in g.iterrows():
-            iou = compute_iou(pbox, [gt["x1"], gt["y1"], gt["x2"], gt["y2"]])
-            if iou > best_iou:
-                best_iou = iou
-                best_gt = int(gt["gt_id"])
-        if best_iou >= float(iou_threshold):
-            pred.at[idx, "gt_id"] = best_gt
-            pred.at[idx, "gt_iou"] = best_iou
-            pred.at[idx, "is_matched"] = True
+        candidates = []
+        best_candidates: dict[object, tuple[float, int, int]] = {}
+        for pred_idx, row in prediction_group.iterrows():
+            pbox = [row["x1"], row["y1"], row["x2"], row["y2"]]
+            for gt_idx, gt_row in gt_group.iterrows():
+                iou = compute_iou(pbox, [gt_row["x1"], gt_row["y1"], gt_row["x2"], gt_row["y2"]])
+                best = best_candidates.get(pred_idx)
+                candidate = (float(iou), int(gt_row["gt_id"]), int(gt_idx))
+                if best is None or candidate[0] > best[0] or (candidate[0] == best[0] and candidate[1:] < best[1:]):
+                    best_candidates[pred_idx] = candidate
+                if iou >= float(iou_threshold):
+                    candidates.append((
+                        -float(iou), int(pred_idx), int(gt_row["gt_id"]), int(gt_idx),
+                    ))
+
+        for pred_idx, (best_iou, gt_id, _gt_idx) in best_candidates.items():
+            pred.at[pred_idx, "candidate_gt_id"] = gt_id
+            pred.at[pred_idx, "best_gt_iou"] = best_iou
+
+        used_predictions: set[int] = set()
+        used_gt_rows: set[int] = set()
+        assigned_claims: dict[int, int] = {}
+        for negative_iou, pred_idx, gt_id, gt_idx in sorted(candidates):
+            if pred_idx in used_predictions or gt_idx in used_gt_rows:
+                continue
+            used_predictions.add(pred_idx)
+            used_gt_rows.add(gt_idx)
+            pred.at[pred_idx, "gt_id"] = gt_id
+            pred.at[pred_idx, "gt_iou"] = -negative_iou
+            pred.at[pred_idx, "is_matched"] = True
+            pred.at[pred_idx, "match_status"] = "matched"
+            assigned_claims[gt_idx] = pred_idx
+
+        for pred_idx in prediction_group.index:
+            if bool(pred.at[pred_idx, "is_matched"]):
+                continue
+            best = best_candidates.get(pred_idx)
+            if best is None or best[0] < float(iou_threshold):
+                pred.at[pred_idx, "match_status"] = "below_iou_threshold"
+                continue
+            eligible_gt = [gt_idx for _neg, candidate_idx, _gt_id, gt_idx in candidates if candidate_idx == pred_idx]
+            claimed_prediction = next((assigned_claims[gt_idx] for gt_idx in eligible_gt if gt_idx in assigned_claims), None)
+            if claimed_prediction is None:
+                pred.at[pred_idx, "match_status"] = "unknown"
+                continue
+            pred.at[pred_idx, "match_status"] = "gt_claimed_by_other_prediction"
+            pred.at[pred_idx, "claimed_by_track_key"] = pred.at[claimed_prediction, "track_key"] if "track_key" in pred else pd.NA
     return pred
+
+
+def build_track_gt_diagnostics(
+    matched_df: pd.DataFrame,
+    track_summary_df: pd.DataFrame | None,
+    iou_threshold: float,
+) -> pd.DataFrame:
+    """Aggregate the evaluator's per-prediction decision for each local track."""
+    summary = track_summary_df.copy() if track_summary_df is not None else pd.DataFrame()
+    if len(summary) == 0 and (matched_df is None or len(matched_df) == 0):
+        return pd.DataFrame(columns=TRACK_GT_DIAGNOSTIC_COLUMNS)
+    if "track_key" not in summary and len(summary):
+        summary["track_key"] = summary["camera"].astype(str) + "_T" + summary["track_id"].astype(int).astype(str)
+
+    evaluated = matched_df.copy() if matched_df is not None else pd.DataFrame()
+    rows = []
+    summary_keys = summary["track_key"].tolist() if "track_key" in summary else []
+    extra_keys = [] if evaluated.empty or "track_key" not in evaluated else [key for key in evaluated["track_key"].dropna().unique() if key not in summary_keys]
+    for track_key in [*summary_keys, *extra_keys]:
+        base = summary[summary["track_key"] == track_key].iloc[0].to_dict() if len(summary) else {}
+        group = evaluated[evaluated["track_key"] == track_key].copy() if "track_key" in evaluated else pd.DataFrame()
+        if not len(group) and not base:
+            continue
+        source_frames = group["source_frame"].dropna().astype(int).unique().tolist() if "source_frame" in group else []
+        first_source = base.get("first_source_frame", min(source_frames) if source_frames else pd.NA)
+        last_source = base.get("last_source_frame", max(source_frames) if source_frames else pd.NA)
+        num_frames = base.get("observed_frame_count", base.get("num_frames", len(source_frames)))
+        if pd.isna(num_frames):
+            num_frames = len(source_frames)
+        span = int(last_source) - int(first_source) + 1 if pd.notna(first_source) and pd.notna(last_source) else 0
+        continuity = base.get("continuity_ratio", float(num_frames) / span if span else pd.NA)
+        statuses = group.get("match_status", pd.Series(dtype=str))
+        matched_count = int((statuses == "matched").sum())
+        unmatched_count = int(len(group) - matched_count)
+        candidate_values = group.get("candidate_gt_id", pd.Series(dtype="Int64")).dropna()
+        candidate_gt = pd.NA
+        if len(candidate_values):
+            counts = candidate_values.astype(int).value_counts()
+            candidate_gt = int(sorted(counts[counts == counts.max()].index)[0])
+        claimed = group.get("claimed_by_track_key", pd.Series(dtype=str)).dropna()
+        claimed = claimed[claimed.astype(str).ne("")]
+        claimed_by = pd.NA
+        claimed_frames = 0
+        if len(claimed):
+            counts = claimed.astype(str).value_counts()
+            claimed_by = sorted(counts[counts == counts.max()].index)[0]
+            claimed_frames = int(group.loc[group["claimed_by_track_key"].astype(str) == claimed_by, "source_frame"].nunique()) if "source_frame" in group else int(counts.max())
+        best_iou = pd.to_numeric(group.get("best_gt_iou", pd.Series(dtype=float)), errors="coerce")
+        rows.append({
+            "camera": base.get("camera", group["camera"].iloc[0] if len(group) else pd.NA),
+            "track_id": base.get("track_id", group["track_id"].iloc[0] if len(group) and "track_id" in group else pd.NA),
+            "track_key": track_key,
+            "first_source_frame": first_source,
+            "last_source_frame": last_source,
+            "num_frames": int(num_frames),
+            "continuity_ratio": continuity,
+            "evaluation_included": bool(len(group)),
+            "matched_frame_count": matched_count,
+            "unmatched_frame_count": unmatched_count,
+            "match_rate": matched_count / len(group) if len(group) else pd.NA,
+            "no_gt_on_frame_count": int((statuses == "no_gt_on_frame").sum()),
+            "below_iou_threshold_count": int((statuses == "below_iou_threshold").sum()),
+            "gt_claimed_by_other_count": int((statuses == "gt_claimed_by_other_prediction").sum()),
+            "unknown_unmatched_count": int((statuses == "unknown").sum()),
+            "candidate_gt_id": candidate_gt,
+            "best_iou_mean": best_iou.mean() if len(best_iou.dropna()) else pd.NA,
+            "best_iou_max": best_iou.max() if len(best_iou.dropna()) else pd.NA,
+            "claimed_by_track_key": claimed_by,
+            "claimed_by_frame_count": claimed_frames,
+            "iou_threshold_used": float(iou_threshold),
+        })
+    return pd.DataFrame(rows, columns=TRACK_GT_DIAGNOSTIC_COLUMNS).sort_values(["camera", "track_id"], kind="stable").reset_index(drop=True)
 
 
 def build_track_summary_with_gt(matched_df: pd.DataFrame) -> pd.DataFrame:
@@ -399,8 +519,7 @@ def build_tracking_standard_metrics(
             "precision": None,
             "recall": None,
             "f1": None,
-            "raw_mota_simple": None,
-            "mota_simple": None,
+            "mota": None,
             "motp_iou": None,
             "id_switch_count": 0,
             "fragmentation_avg": None,
@@ -439,8 +558,8 @@ def build_tracking_standard_metrics(
     detected_gt_ids = int(matched["gt_id"].nunique()) if "gt_id" in matched and len(matched) else 0
     identity_coverage_rate = detected_gt_ids / max(1, total_gt_ids)
 
-    raw_mota_simple = 1.0 - ((fn + fp + id_switch_count) / max(1, total_gt_rows))
-    mota_simple = max(0.0, min(1.0, raw_mota_simple))
+    mota = 1.0 - ((fn + fp + id_switch_count) / max(1, total_gt_rows))
+    # MOTA is an academic metric and may legitimately be negative.
 
     return pd.DataFrame([{
         "score_available": True,
@@ -452,15 +571,14 @@ def build_tracking_standard_metrics(
         "precision": float(precision),
         "recall": float(recall),
         "f1": float(f1),
-        "raw_mota_simple": float(raw_mota_simple),
-        "mota_simple": float(mota_simple),
+        "mota": float(mota),
         "motp_iou": float(motp_iou),
         "id_switch_count": id_switch_count,
         "fragmentation_avg": fragmentation_avg,
         "mean_track_purity": mean_track_purity,
         "false_positive_rate": float(false_positive_rate),
         "identity_coverage_rate": float(identity_coverage_rate),
-        "note": "Metrik akademik berbasis GT. MOTA sederhana memakai FN, FP, dan ID switch dari evaluasi tracking.",
+        "note": "Metrik akademik berbasis GT.",
     }])
 
 
@@ -489,6 +607,44 @@ def build_gt_coverage_detail(matched_df: pd.DataFrame, gt_df: pd.DataFrame) -> p
     out["mean_conf"] = out["mean_conf"].fillna(0.0)
     out["coverage_per_gt"] = out["detected_frames"] / out["gt_frames"].clip(lower=1)
     return out.sort_values(["camera", "gt_id"]).reset_index(drop=True)
+
+
+def build_gt_temporal_coverage(matched_df: pd.DataFrame, gt_df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    columns = ["camera", "gt_id", "gt_first_source_frame", "gt_last_source_frame", "gt_frame_count", "matched_first_source_frame", "matched_last_source_frame", "matched_frame_count", "missed_frame_count", "temporal_coverage", "matched_track_keys", "num_matched_tracks", "longest_missed_gap", "coverage_status"]
+    if gt_df is None or len(gt_df) == 0:
+        return pd.DataFrame(columns=columns), pd.DataFrame()
+    matched = matched_df[matched_df["gt_id"] > 0].copy() if matched_df is not None and len(matched_df) and "gt_id" in matched_df else pd.DataFrame()
+    rows = []
+    for (camera, gt_id), group in gt_df.groupby(["camera", "gt_id"], sort=True):
+        frames = sorted(group["source_frame"].dropna().astype(int).unique().tolist())
+        matched_group = matched[(matched["camera"] == camera) & (matched["gt_id"] == gt_id)] if len(matched) else pd.DataFrame()
+        matched_frames = set(matched_group["source_frame"].dropna().astype(int).unique().tolist()) if len(matched_group) else set()
+        matched_frames &= set(frames)
+        longest_gap = current_gap = 0
+        previous = None
+        for frame in frames:
+            if previous is None or frame != previous + 1:
+                current_gap = 0
+            if frame in matched_frames:
+                current_gap = 0
+            else:
+                current_gap += 1
+                longest_gap = max(longest_gap, current_gap)
+            previous = frame
+        tracks = sorted(matched_group["track_key"].dropna().astype(str).unique().tolist()) if len(matched_group) and "track_key" in matched_group else []
+        gt_count = len(frames)
+        matched_count = len(matched_frames)
+        coverage = matched_count / gt_count if gt_count else None
+        status = "Tidak berlaku" if not gt_count else "Tercakup penuh" if coverage == 1 else "Tercakup sebagian" if coverage and coverage > 0 else "Tidak ditemukan"
+        rows.append({"camera": camera, "gt_id": int(gt_id), "gt_first_source_frame": frames[0] if frames else None, "gt_last_source_frame": frames[-1] if frames else None, "gt_frame_count": gt_count, "matched_first_source_frame": min(matched_frames) if matched_frames else None, "matched_last_source_frame": max(matched_frames) if matched_frames else None, "matched_frame_count": matched_count, "missed_frame_count": max(0, gt_count - matched_count), "temporal_coverage": coverage, "matched_track_keys": ", ".join(tracks), "num_matched_tracks": len(tracks), "longest_missed_gap": longest_gap, "coverage_status": status})
+    coverage_df = pd.DataFrame(rows, columns=columns)
+    summary_rows = []
+    for gt_id, group in coverage_df.groupby("gt_id", sort=True):
+        total = int(group["gt_frame_count"].sum())
+        found = int(group["matched_frame_count"].sum())
+        tracks = sorted({track.strip() for value in group["matched_track_keys"] for track in str(value).split(",") if track.strip()})
+        summary_rows.append({"gt_id": int(gt_id), "cameras": ", ".join(sorted(group["camera"].astype(str).tolist())), "num_cameras": int(group["camera"].nunique()), "total_gt_frame_count": total, "total_matched_frame_count": found, "total_missed_frame_count": max(0, total - found), "overall_temporal_coverage": found / total if total else None, "all_matched_track_keys": ", ".join(tracks), "num_matched_tracks": len(tracks)})
+    return coverage_df, pd.DataFrame(summary_rows)
 
 
 def evaluate_global_id_with_gt(global_track_meta_df: pd.DataFrame, matched_df: pd.DataFrame):
@@ -535,6 +691,8 @@ def build_reid_pairwise_evaluation(
     empty_summary = pd.DataFrame([{
         "score_available": False,
         "association_eval_available": False,
+        "num_output_tracks": int(meta["track_key"].nunique()) if len(meta) and "track_key" in meta else 0,
+        "num_output_global_ids": int(meta["global_id"].nunique()) if len(meta) and "global_id" in meta else 0,
         "num_eval_tracks": 0,
         "positive_pair_count": 0,
         "negative_pair_count": 0,
@@ -548,9 +706,10 @@ def build_reid_pairwise_evaluation(
         "pairwise_f1": None,
         "false_merge_rate": None,
         "false_split_rate": None,
-        "mean_global_id_purity": None,
+        "global_id_purity": None,
         "mixed_gid_count": None,
         "expected_global_ids": None,
+        "num_eval_global_ids": None,
         "num_global_ids": None,
         "reduction_required": None,
         "reduction_achieved": None,
@@ -670,12 +829,16 @@ def build_reid_pairwise_evaluation(
     reduction_required = max(0, int(num_eval_tracks) - expected_global_ids)
     reduction_achieved = max(0, int(num_eval_tracks) - num_global_ids)
 
-    gid_purity_rows = []
+    group_purity = []
     for _, group in eval_tracks.groupby("global_id"):
-        gt_ids = {int(x) for x in group["dominant_gt_id"].dropna().tolist() if int(x) > 0}
-        gid_purity_rows.append(len(gt_ids) <= 1)
-    mixed_gid_count = int(sum(not x for x in gid_purity_rows))
-    mean_global_id_purity = float(sum(gid_purity_rows) / max(1, len(gid_purity_rows))) if gid_purity_rows else None
+        counts = group["dominant_gt_id"].value_counts()
+        dominant_count = int(counts.iloc[0]) if len(counts) else 0
+        group_purity.append((dominant_count, int(len(group))))
+    mixed_gid_count = int(sum(dominant < total for dominant, total in group_purity))
+    global_id_purity = (
+        float(sum(dominant for dominant, _ in group_purity) / sum(total for _, total in group_purity))
+        if group_purity else None
+    )
 
     association_available = positive_pair_count > 0
     if association_available:
@@ -696,6 +859,8 @@ def build_reid_pairwise_evaluation(
     summary = pd.DataFrame([{
         "score_available": True,
         "association_eval_available": bool(association_available),
+        "num_output_tracks": int(meta["track_key"].nunique()),
+        "num_output_global_ids": int(meta["global_id"].nunique()),
         "num_eval_tracks": num_eval_tracks,
         "positive_pair_count": positive_pair_count,
         "negative_pair_count": negative_pair_count,
@@ -709,9 +874,10 @@ def build_reid_pairwise_evaluation(
         "pairwise_f1": pairwise_f1,
         "false_merge_rate": false_merge_rate,
         "false_split_rate": false_split_rate,
-        "mean_global_id_purity": mean_global_id_purity,
+        "global_id_purity": global_id_purity,
         "mixed_gid_count": mixed_gid_count,
         "expected_global_ids": expected_global_ids,
+        "num_eval_global_ids": num_global_ids,
         "num_global_ids": num_global_ids,
         "reduction_required": reduction_required,
         "reduction_achieved": reduction_achieved,

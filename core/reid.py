@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -15,31 +17,75 @@ REID_TRANSFORM = transforms.Compose([
 ])
 
 
-def build_sampled_track_crop_df(valid_tracks_df: pd.DataFrame, filter_cfg: dict) -> pd.DataFrame:
+def build_sampled_track_crop_df(
+    valid_tracks_df: pd.DataFrame,
+    filter_cfg: dict,
+    camera_configs: dict | None = None,
+) -> pd.DataFrame:
     if valid_tracks_df is None or len(valid_tracks_df) == 0:
         return pd.DataFrame()
 
-    max_samples = int(filter_cfg.get("max_samples_per_track", 48))
-    strategy = filter_cfg.get("crop_selection_strategy", "quality")
     rows = []
 
     df = valid_tracks_df.copy()
     df["quality_score"] = df["conf"].astype(float) * np.log1p(df["area"].astype(float))
 
     for track_key, g in df.groupby("track_key"):
-        if strategy == "uniform":
-            g = g.sort_values("frame")
-            if len(g) > max_samples:
-                idx = np.linspace(0, len(g) - 1, max_samples).round().astype(int)
-                chosen = g.iloc[idx]
-            else:
-                chosen = g
-        else:
-            chosen = g.sort_values("quality_score", ascending=False).head(max_samples).sort_values("frame")
+        camera = str(g["camera"].iloc[0])
+        camera_filter = ((camera_configs or {}).get(camera) or {}).get("filter") or filter_cfg
+        max_samples = int(camera_filter.get("max_samples_per_track", 48))
+        chosen = g.sort_values("quality_score", ascending=False).head(max_samples).sort_values("frame")
         rows.append(chosen)
 
     sampled = pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
     return sampled.drop(columns=["quality_score"], errors="ignore")
+
+
+def _fingerprint(value: object) -> str:
+    encoded = json.dumps(value, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def build_embedding_manifest(
+    valid_df: pd.DataFrame,
+    sampled_df: pd.DataFrame,
+    osnet_weight: str | Path | None,
+    feature_dim: int | None = None,
+) -> dict:
+    weight_path = Path(osnet_weight) if osnet_weight else None
+    weight_fingerprint = None
+    if weight_path and weight_path.exists():
+        digest = hashlib.sha256()
+        with weight_path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        weight_fingerprint = digest.hexdigest()
+    selected = sampled_df.copy() if sampled_df is not None else pd.DataFrame()
+    selected_columns = [col for col in ["track_key", "camera", "frame", "crop_path"] if col in selected]
+    valid_columns = [col for col in ["track_key", "camera", "frame", "crop_path"] if col in valid_df]
+    return {
+        "cache_format_version": 1,
+        "model_architecture": "osnet_x1_0",
+        "weight_path": str(weight_path) if weight_path else None,
+        "weight_fingerprint": weight_fingerprint,
+        "embedding_dim": int(feature_dim) if feature_dim is not None else None,
+        "valid_track_fingerprint": _fingerprint(valid_df[valid_columns].to_dict("records") if valid_columns else []),
+        "selected_crop_fingerprint": _fingerprint(selected[selected_columns].to_dict("records") if selected_columns else []),
+        "max_samples_per_track": sorted(set(selected.groupby("track_key").size().tolist())) if len(selected) else [],
+        "crop_selection_method": "quality_score",
+        "preprocessing": {"resize": [256, 128], "normalize_mean": [0.485, 0.456, 0.406], "normalize_std": [0.229, 0.224, 0.225]},
+    }
+
+
+def embedding_cache_is_valid(manifest_path: str | Path, expected_manifest: dict, features_path: str | Path) -> bool:
+    try:
+        actual = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        features = np.load(features_path, mmap_mode="r")
+    except Exception:
+        return False
+    expected = dict(expected_manifest)
+    expected["embedding_dim"] = int(features.shape[1]) if features.ndim == 2 else None
+    return actual == expected
 
 
 @torch.no_grad()

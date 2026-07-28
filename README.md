@@ -1,182 +1,227 @@
-# Person Re-ID Multi-Kamera
+# Person Re-Identification Multi-Kamera
 
-Aplikasi Streamlit untuk demo pipeline person re-identification multi-kamera. Pipeline memakai YOLO11n untuk deteksi orang, BoT-SORT dari Ultralytics untuk local tracking, OSNet untuk embedding Re-ID, lalu association untuk membentuk Global ID.
+Aplikasi Streamlit untuk demonstrasi person re-identification pada satu atau
+beberapa kamera. Sistem membentuk local track per kamera, menyaring track yang
+tidak memenuhi kualitas minimum, lalu mengasosiasikan track menjadi Global ID.
 
-Dokumentasi lengkap ada di [dokumentasi.md](dokumentasi.md). Ringkasan hasil run terakhir per case ada di [output.md](output.md).
+## Arsitektur
 
-## Fitur Utama
+```text
+YOLO11n
+  → BoT-SORT
+  → filtering local track
+  → OSNet crop embedding
+  → mean track-level embedding
+  → cosine similarity
+  → intra/cross-camera association
+  → Global ID
+  → evaluasi ground truth
+  → tabel, gallery, dan video
+```
 
-- 6 demo case: single-camera normal, crowded fragmentation, limitation case, multi-camera success, 3-video stress test, dan temporal handoff.
-- Config tracking dan filter dapat diatur per kamera.
-- Config Re-ID diatur pada level case dan diterapkan lewat form supaya perubahan parameter Re-ID tidak menjalankan ulang tracking.
-- Snapshot config runtime disimpan ke `config_used.json`, `camera_config_used.json`, `generated_tracker_config_used.yaml`, `tracking_runtime_manifest.yaml`, dan `reid_config_used.json`.
-- Output diagnostik filter track menampilkan threshold aktual, pass/fail tiap syarat, dan `filter_reason`.
-- Output Re-ID menampilkan pair similarity, merged pairs, global ID metadata, pairwise evaluation, gallery, dan render video.
+- YOLO menerima `yolo_conf`, `yolo_iou`, dan `imgsz` sebagai argumen langsung
+  `model.track()`.
+- Threshold BoT-SORT ditulis ke YAML tracker yang dibuat untuk setiap kamera.
+- Tracking dan filter dapat berbeda untuk setiap kamera.
+- Association/Re-ID berlaku pada tingkat case.
+- Perubahan Re-ID mempertahankan hasil tracking. Perubahan tracking/filter
+  hanya membuat kamera yang konfigurasinya berubah menjadi stale.
 
-## Struktur Repo
+## Struktur Repository
 
 ```text
 .
-|-- app.py
-|-- requirements.txt
-|-- README.md
-|-- dokumentasi.md
-|-- output.md
-|-- assets/
-|   |-- cases/
-|   |-- weights/
-|   `-- annotations/
-|-- config/
-|-- core/
-|-- ui/
-|-- utils/
-|-- outputs/
-`-- uploads/
+├── app.py                 # entry point Streamlit
+├── config/
+│   ├── cases.py           # enam case, urutan kamera, dan path video
+│   ├── gt_cases.py        # metadata annotation dan source frame
+│   └── presets.py         # default, rekomendasi, normalisasi, validasi
+├── core/
+│   ├── pipeline.py        # orkestrasi tracking, Re-ID, evaluasi, render
+│   ├── tracking.py        # YOLO, BoT-SORT, crop, filter, track count
+│   ├── reid.py            # sampling dan embedding OSNet
+│   ├── association.py     # similarity, MNN, temporal rule, Global ID
+│   ├── evaluation.py      # parser GT dan metrik
+│   ├── gallery.py
+│   ├── render.py
+│   ├── models.py
+│   └── paths.py
+├── ui/
+│   ├── app.py
+│   ├── config_panel.py
+│   ├── state.py
+│   ├── result_adapter.py
+│   ├── results_panel.py
+│   └── components.py
+├── utils/
+├── tests/
+├── assets/
+│   ├── cases/
+│   ├── annotations/
+│   └── weights/
+├── outputs/               # hasil runtime; di-ignore
+└── uploads/               # file runtime; di-ignore
 ```
 
-`outputs/`, `uploads/`, video demo, model weight, virtual environment, dan cache Python tidak dipush ke GitHub. Folder placeholder tetap disimpan dengan `.gitkeep` atau README kecil.
+Script pencarian konfigurasi satu kali tidak menjadi bagian runtime dan tidak
+menjadi sumber preset. Satu-satunya sumber rekomendasi aplikasi adalah
+`config/presets.py::CASE_RECOMMENDATIONS`.
 
-## Instalasi
+## Versi Python dan Instalasi
 
 Gunakan Python 3.10 atau 3.11.
 
-### Windows + NVIDIA GPU
-
-Untuk laptop/PC NVIDIA, gunakan installer CUDA PyTorch khusus agar `torch` tidak terpasang sebagai CPU-only build dari PyPI default.
+### Windows dan NVIDIA CUDA
 
 ```powershell
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 .\setup_windows_cuda.ps1
-python -m streamlit run app.py
-```
-
-Jalankan Streamlit dengan `python -m streamlit run app.py`, bukan langsung `streamlit run app.py`, supaya executable yang dipakai pasti berasal dari environment Python aktif.
-
-Validasi CUDA:
-
-```powershell
 python check_cuda.py
 ```
 
-Target output:
+Script tersebut membuat atau menggunakan `.venv`, memasang dependency runtime,
+kemudian memasang PyTorch/torchvision CUDA 12.6 dari `requirements-cuda.txt`.
 
-- `torch.__version__` mengandung `+cu126`.
-- `torch.version.cuda` bernilai `12.6`.
-- `torch.cuda.is_available()` bernilai `True`.
-- Device name menampilkan GPU NVIDIA, misalnya `NVIDIA GeForce RTX 4060 Laptop GPU`.
-
-Jika koneksi putus saat download wheel PyTorch CUDA yang besar, ulangi dari venv aktif:
+### Environment manual
 
 ```powershell
-python -m pip install --timeout 1000 --retries 20 --prefer-binary -r requirements-cuda.txt
-python check_cuda.py
-```
-
-Jika `torch.__version__` masih mengandung `+cpu`, uninstall build CPU dulu:
-
-```powershell
-python -m pip uninstall -y torch torchvision torchaudio
-python -m pip install --timeout 1000 --retries 20 --prefer-binary -r requirements-cuda.txt
-python check_cuda.py
-```
-
-### CPU atau Environment Manual
-
-```bash
 python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-`requirements.txt` sengaja tidak berisi `torch` dan `torchvision`, supaya PyTorch CPU-only tidak terpasang diam-diam dari PyPI default. Untuk GPU, install PyTorch dari `requirements-cuda.txt`.
+`requirements.txt` tidak memasang PyTorch secara langsung. Pasang build PyTorch
+yang sesuai perangkat, lalu pasang dependency pengujian:
 
-## Model dan Dataset
+```powershell
+python -m pip install -r requirements-dev.txt
+```
 
-Letakkan file model di:
+## Model Weight
+
+Letakkan bobot berikut di `assets/weights/`:
 
 ```text
-assets/weights/yolo11n.pt
-assets/weights/osnet_x1_0_msmt17_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth
+yolo11n.pt
+osnet_x1_0_msmt17_256x128_amsgrad_ep150_stp60_lr0.0015_b64_fb10_softmax_labelsmooth_flip.pth
 ```
 
-Letakkan video demo sesuai case:
+Bobot model di-ignore oleh Git. Jika bobot YOLO lokal tidak ada, Ultralytics
+dapat mencoba mengambil `yolo11n.pt`; bobot OSNet wajib tersedia secara lokal.
 
-```text
-assets/cases/case_1_normal_success/camera_2.mp4
-assets/cases/case_2_crowded_fragmentation/camera_3.mp4
-assets/cases/case_3_failure_limitation/camera_1.mp4
-assets/cases/case_4_multicamera_success/camera_1.mp4
-assets/cases/case_4_multicamera_success/camera_3.mp4
-assets/cases/case_5_multicamera_3_video_stress/camera_1.mp4
-assets/cases/case_5_multicamera_3_video_stress/camera_2.mp4
-assets/cases/case_5_multicamera_3_video_stress/camera_3.mp4
-assets/cases/case_6_multicamera_temporal_handoff/camera_6.mp4
-assets/cases/case_6_multicamera_temporal_handoff/camera_5.mp4
-```
+## Enam Case
 
-## Menjalankan App
+| Case | Kamera |
+|---|---|
+| `case_1_normal_success` | `camera_2` |
+| `case_2_crowded_fragmentation` | `camera_3` |
+| `case_3_failure_limitation` | `camera_1` |
+| `case_4_multicamera_success` | `camera_1`, `camera_3` |
+| `case_5_multicamera_3_video_stress` | `camera_1`, `camera_2`, `camera_3` |
+| `case_6_multicamera_temporal_handoff` | `camera_6`, `camera_5` |
 
-```bash
+Definisi case dan path video berada di `config/cases.py`. Metadata annotation
+serta rentang source frame berada di `config/gt_cases.py`.
+
+## Mode Konfigurasi
+
+UI menyediakan dua mode:
+
+1. **Konfigurasi Rekomendasi**
+   - read-only;
+   - dibangun oleh `build_recommended_config()`;
+   - langsung menjadi konfigurasi runtime aktif.
+2. **Konfigurasi Awal Analisis**
+   - dapat diedit melalui form;
+   - perubahan dapat diterapkan ke semua kamera atau satu kamera;
+   - nilai dinormalisasi dan divalidasi sebelum digunakan.
+
+Tracking/filter disimpan dalam `camera_configs.<camera>`. Re-ID disimpan pada
+bagian `reid` tingkat case. Nilai top-level tracking/filter hanya menjadi
+representasi umum dan fallback jika override kamera tidak tersedia.
+
+## Menjalankan Aplikasi
+
+```powershell
 python -m streamlit run app.py
 ```
 
-Flow umum:
+Alur UI:
 
-1. Pilih tab case.
-2. Cek status video, annotation, CUDA, dan model.
-3. Atur Tracking + Filter Config jika perlu.
-4. Klik `Jalankan tracking` atau `Jalankan tracking semua kamera`.
-5. Atur Re-ID config di form, lalu klik `Terapkan config Re-ID`.
-6. Klik `Jalankan Re-ID`.
-7. Klik `Render video` jika ingin output video final.
+1. Buka tab case.
+2. Pilih mode konfigurasi.
+3. Jalankan tracking untuk satu kamera atau semua kamera.
+4. Pastikan seluruh kamera berstatus siap.
+5. Jalankan Re-ID dan pembentukan Global ID.
+6. Jalankan render jika video hasil diperlukan.
 
-## Case 2 Recommended Config
+Tab Ringkasan membedakan:
 
-Recommended config final Case 2 saat ini:
+- **Raw Track**: pasangan unik `(camera, track_id)` sebelum filtering.
+- **Valid Track**: pasangan unik yang lolos seluruh filter.
+- **Track Terfilter**: `Raw Track - Valid Track`.
+- **False Merge Rate** dan **False Split Rate**: rate 0–1 dari evaluasi
+  pairwise, bukan jumlah error mentah.
 
-```json
-{
-  "tracking": {
-    "yolo_conf": 0.2,
-    "yolo_iou": 0.5,
-    "imgsz": 640,
-    "track_high_thresh": 0.2,
-    "track_low_thresh": 0.05,
-    "new_track_thresh": 0.2,
-    "match_thresh": 0.8,
-    "track_buffer": 45
-  },
-  "filter": {
-    "min_frames": 80,
-    "min_crops": 80,
-    "min_avg_conf": 0.4,
-    "min_avg_area": 3000.0,
-    "max_samples_per_track": 32,
-    "crop_selection_strategy": "quality"
-  },
-  "reid": {
-    "enable_cross_camera": false,
-    "enable_strict_intra": true,
-    "cross_threshold": 0.75,
-    "intra_threshold": 0.78,
-    "intra_max_gap": 30,
-    "intra_max_overlap": 0,
-    "use_mnn": true
-  }
-}
+Jika artefak lama tidak menyediakan data yang cukup untuk menghitung suatu
+nilai, UI menampilkan `–` dan tidak menyalin count lain sebagai pengganti.
+
+## Output Runtime
+
+Setiap run berada di `outputs/<case_id>/<run_id>/`. Artefak utama:
+
+```text
+config_used.json
+run_manifest.json
+track_count_summary_by_camera.csv
+local_tracks.csv
+valid_tracks_all.csv
+valid_track_summary.csv
+tracking_standard_metrics.csv
+pair_similarity.csv
+merged_pairs.csv
+global_track_meta.csv
+reid_pairwise_evaluation.csv
+reid_config_used.json
+embedding_manifest.json
+gallery_local/
+gallery_global/
+merge_gallery/
+*_rendered.mp4
 ```
 
-## GitHub Notes
+Setiap folder kamera juga menyimpan:
 
-File besar dan output lokal di-ignore:
+```text
+camera_config_used.json
+generated_tracker_config_used.yaml
+tracking_runtime_manifest.yaml
+local_tracks.csv
+local_tracks_valid.csv
+valid_track_summary.csv
+```
 
-- `.venv/`
-- `__pycache__/`
-- `outputs/`
-- `uploads/`
-- `assets/weights/*.pt`
-- `assets/weights/*.pth`
-- `assets/cases/**/*.mp4`
-- file cache dan temporary lain
+`run_manifest.json` baru menggunakan `output_schema_version: 2` dan menyimpan
+`raw_track_count`, `valid_track_count`, serta `filtered_track_count`.
 
-Repo ini siap dipush sebagai source code. Model, video, dan output run dibuat atau ditempatkan secara lokal setelah clone.
+## Pengujian
+
+```powershell
+python -m compileall app.py config core ui utils
+python -c "import app; import ui.app; import core.pipeline; import config.presets"
+python -m pytest -q --basetemp=.pytest_tmp
+```
+
+Test mencakup schema/preset konfigurasi, override kamera, tracker YAML, direct
+YOLO args, filtering, track counts, association, pairwise rates, cache,
+manifest compatibility, state invalidation, adapter UI, dan Streamlit AppTest.
+
+## File Lokal dan Git
+
+`.gitignore` mengecualikan virtual environment, cache Python/pytest, model
+weight, video demo, output run, embedding cache, log, serta file IDE. Folder
+placeholder tetap disimpan melalui `.gitkeep` atau README kecil.
+
+Sebelum menjalankan aplikasi setelah clone, sediakan video case dan bobot model
+secara lokal sesuai path di atas.

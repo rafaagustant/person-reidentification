@@ -12,18 +12,12 @@ import pandas as pd
 import torch
 
 from config.presets import get_camera_stage_config, normalize_config
-from config.scoring import SCORE_WEIGHTS
 from core.association import assign_global_ids, compute_track_similarity_df
-from core.diagnostics import (
-    build_reid_diagnostics,
-    build_reid_tuning_hints,
-    build_tracking_diagnostics,
-    build_tracking_tuning_hints,
-    save_tuning_hints,
-)
 from core.evaluation import (
     add_source_frame,
     build_gt_coverage_detail,
+    build_gt_temporal_coverage,
+    build_track_gt_diagnostics,
     build_reid_pairwise_evaluation,
     build_gt_debug_info,
     build_tracking_standard_metrics,
@@ -37,12 +31,14 @@ from core.gallery import build_global_id_gallery, build_local_track_gallery, bui
 from core.models import get_device, load_osnet_model, load_yolo_model
 from core.paths import OUTPUT_ROOT
 from core.reid import (
+    build_embedding_manifest,
     build_sampled_track_crop_df,
     build_track_embedding_df,
+    embedding_cache_is_valid,
     extract_embeddings_from_sampled_df,
 )
 from core.render import combine_videos_grid, make_streamlit_playable, render_camera_video
-from core.tracking import filter_valid_tracks, process_video_tracking
+from core.tracking import build_track_count_summary, count_unique_tracks, filter_valid_tracks, process_video_tracking
 from utils.helpers import ensure_dir, save_json, timestamp_id
 
 
@@ -110,6 +106,14 @@ def _merge_full_track_span(
             avg_area=("area", "mean"),
         )
     )
+    if "source_frame" in valid_df:
+        source_frames = (
+            valid_df.groupby("track_key")["source_frame"]
+            .apply(lambda values: tuple(sorted({int(value) for value in values.dropna()})))
+            .rename("source_frames")
+            .reset_index()
+        )
+        track_span_df = track_span_df.merge(source_frames, on="track_key", how="left")
 
     drop_cols = [
         "first_frame",
@@ -117,6 +121,7 @@ def _merge_full_track_span(
         "num_frames",
         "avg_conf",
         "avg_area",
+        "source_frames",
     ]
 
     out = track_embedding_df.drop(columns=drop_cols, errors="ignore").merge(
@@ -130,108 +135,6 @@ def _merge_full_track_span(
             out[col] = out[col].astype("Int64")
 
     return out
-
-
-def _empty_tracking_score(valid_track_count: int, runtime_sec: float = 0.0, reason: str | None = None) -> pd.DataFrame:
-    return pd.DataFrame([{
-        "score_available": False,
-        "tracking_score": None,
-        "identity_coverage_rate": None,
-        "precision": None,
-        "recall": None,
-        "f1": None,
-        "mean_track_purity": None,
-        "fragmentation_quality": None,
-        "false_positive_quality": None,
-        "mixed_track_quality": None,
-        "mixed_track_count": None,
-        "reason": reason or "GT tidak tersedia; hanya operational summary yang ditampilkan.",
-        "num_valid_tracks": int(valid_track_count),
-        "runtime_sec": round(float(runtime_sec or 0.0), 2),
-    }])
-
-
-def _clamp01(value) -> float:
-    try:
-        return max(0.0, min(1.0, float(value)))
-    except Exception:
-        return 0.0
-
-
-def _weighted_score(values: dict, weights: dict) -> float:
-    total_weight = sum(float(v) for v in weights.values())
-    if total_weight <= 0:
-        return 0.0
-    return sum(_clamp01(values.get(key, 0.0)) * float(weight) for key, weight in weights.items()) / total_weight
-
-
-def _tracking_metrics_for_score(
-    tracking_eval_df: pd.DataFrame | None,
-    gt_coverage_df: pd.DataFrame | None,
-    track_summary_gt_df: pd.DataFrame | None,
-) -> pd.DataFrame:
-    if tracking_eval_df is None or len(tracking_eval_df) == 0:
-        return pd.DataFrame()
-    row = tracking_eval_df.iloc[0].to_dict()
-    coverage = gt_coverage_df if gt_coverage_df is not None else pd.DataFrame()
-    track_gt = track_summary_gt_df if track_summary_gt_df is not None else pd.DataFrame()
-    detected_gt_ids = int((coverage.get("detected_frames", pd.Series(dtype=int)) > 0).sum()) if len(coverage) else 0
-    total_gt_ids = int(len(coverage)) if len(coverage) else 0
-    precision = float(row.get("pred_match_rate", 0.0))
-    recall = float(row.get("gt_coverage_rate", 0.0))
-    f1 = 2 * precision * recall / max(precision + recall, 1e-9)
-    mixed = int((track_gt.get("track_gt_purity", pd.Series(dtype=float)) < 1.0).sum()) if len(track_gt) else 0
-    return pd.DataFrame([{
-        "detected_gt_ids": detected_gt_ids,
-        "identity_coverage_rate": detected_gt_ids / max(1, total_gt_ids),
-        "precision": precision,
-        "recall": recall,
-        "f1": f1,
-        "mean_track_purity": float(row.get("mean_track_purity", 0.0)),
-        "fragmentation_avg": float(row.get("fragmentation_avg", 0.0)),
-        "false_positive_rate": float(row.get("false_positive_rate", 0.0)),
-        "mixed_track_count": mixed,
-    }])
-
-
-def _tracking_score_df(
-    valid_tracks_df: pd.DataFrame | None,
-    metrics_df: pd.DataFrame | None,
-    runtime_sec: float = 0.0,
-    gt_available: bool = False,
-    valid_summary_df: pd.DataFrame | None = None,
-) -> pd.DataFrame:
-    valid = valid_tracks_df if valid_tracks_df is not None else pd.DataFrame()
-    summary = valid_summary_df if valid_summary_df is not None else pd.DataFrame()
-    if len(summary) and {"track_key", "is_valid"}.issubset(summary.columns):
-        valid_track_count = int(summary[_truthy_series(summary["is_valid"])]["track_key"].nunique())
-    else:
-        valid_track_count = int(valid["track_key"].nunique()) if len(valid) and "track_key" in valid else 0
-    if metrics_df is None or len(metrics_df) == 0 or not gt_available:
-        return _empty_tracking_score(valid_track_count, runtime_sec)
-
-    row = metrics_df.iloc[0].to_dict()
-    fragmentation_avg = float(row.get("fragmentation_avg", 0.0))
-    mixed_count = int(row.get("mixed_track_count", 0))
-    score_inputs = {
-        "identity_coverage_rate": row.get("identity_coverage_rate", 0.0),
-        "precision": row.get("precision", 0.0),
-        "recall": row.get("recall", 0.0),
-        "f1": row.get("f1", 0.0),
-        "mean_track_purity": row.get("mean_track_purity", 0.0),
-        "fragmentation_quality": 1.0 / max(1.0, fragmentation_avg),
-        "false_positive_quality": 1.0 - float(row.get("false_positive_rate", 0.0)),
-        "mixed_track_quality": 1.0 - (mixed_count / max(1, valid_track_count)),
-    }
-    score = _weighted_score(score_inputs, SCORE_WEIGHTS["tracking"])
-    return pd.DataFrame([{
-        "score_available": True,
-        "tracking_score": score,
-        **{key: _clamp01(value) for key, value in score_inputs.items()},
-        "mixed_track_count": mixed_count,
-        "num_valid_tracks": valid_track_count,
-        "runtime_sec": round(float(runtime_sec or 0.0), 2),
-    }])
 
 
 def _read_csv_if_exists(path: Path) -> pd.DataFrame:
@@ -257,59 +160,53 @@ def _valid_summary_only(summary_df: pd.DataFrame | None) -> pd.DataFrame:
     return summary_df[_truthy_series(summary_df["is_valid"])].copy()
 
 
-def _sync_dirty_single_camera_config(config: dict, selected_cameras: list[str]) -> dict:
-    if len(selected_cameras) != 1:
-        return config
-    custom = config.get("custom") or {}
-    if not custom.get("tracking_config_dirty"):
-        return config
-    camera = selected_cameras[0]
-    out = copy.deepcopy(config)
-    camera_cfg = out.setdefault("camera_configs", {}).setdefault(camera, {})
-    camera_cfg["tracking"] = copy.deepcopy(out.get("tracking", {}))
-    camera_cfg["filter"] = copy.deepcopy(out.get("filter", {}))
-    return out
-
-
-def _tracking_fingerprint(tracking_cfg: dict) -> str:
-    payload = json.dumps(tracking_cfg or {}, sort_keys=True, separators=(",", ":"))
+def _tracking_fingerprint(tracking_cfg: dict, filter_cfg: dict | None = None, video_path: str | Path | None = None) -> str:
+    payload = json.dumps({"tracking": tracking_cfg or {}, "filter": filter_cfg or {}, "video": str(video_path or "")}, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _camera_status_rows(case: dict, run_dir: Path, camera_configs: dict, cameras_done: set[str]) -> pd.DataFrame:
+def _camera_status_rows(
+    case: dict,
+    run_dir: Path,
+    cameras_done: set[str],
+    camera_runtime: dict[str, float],
+) -> pd.DataFrame:
     rows = []
     for camera in case["cameras"]:
         cam_dir = run_dir / camera
         valid_path = cam_dir / "local_tracks_valid.csv"
         raw_path = cam_dir / "local_tracks.csv"
         status = "done" if camera in cameras_done and valid_path.exists() else "not_run"
-        score_df = _read_csv_if_exists(cam_dir / "flow1_tracking_score.csv")
-        score = score_df.iloc[0].get("tracking_score") if len(score_df) and "tracking_score" in score_df else None
         valid_df = _read_csv_if_exists(valid_path)
+        raw_df = _read_csv_if_exists(raw_path)
+        raw_track_count = count_unique_tracks(raw_df)
+        valid_track_count = count_unique_tracks(valid_df)
         rows.append({
             "camera": camera,
             "status": status,
             "local_tracks_exists": raw_path.exists(),
             "valid_tracks_exists": valid_path.exists(),
-            "num_valid_tracks": int(valid_df["track_key"].nunique()) if len(valid_df) and "track_key" in valid_df else 0,
-            "tracking_score": score,
-            "profile": camera_configs.get(camera, {}).get("profile"),
-            "config_mode": camera_configs.get(camera, {}).get("config_mode", "uniform"),
+            "raw_track_count": raw_track_count,
+            "valid_track_count": valid_track_count,
+            "filtered_track_count": max(0, raw_track_count - valid_track_count),
+            "num_valid_tracks": valid_track_count,
+            "runtime_sec": round(float(camera_runtime.get(camera, 0.0)), 2),
         })
     return pd.DataFrame(rows)
 
 
-def _evaluate_tracking_outputs(
+def _evaluate_tracking_scope(
     case: dict,
-    run_dir: Path,
-    raw_tracks_all: pd.DataFrame,
-    valid_tracks_all: pd.DataFrame,
-    valid_summary_all: pd.DataFrame,
+    predictions: pd.DataFrame,
     gt_df: pd.DataFrame,
-    gt_loader_debug: dict,
+    output_dir: Path,
+    gt_loader_debug: dict | None = None,
+    include_temporal_coverage: bool = False,
+    write_empty_details: bool = False,
+    track_summary_df: pd.DataFrame | None = None,
 ) -> dict:
-    # Evaluasi GT sengaja dipusatkan di sini agar format CSV tracking tetap konsisten.
-    valid_eval_df = add_source_frame(valid_tracks_all, case)
+    # Evaluasi GT menggunakan prediksi pada scope kamera yang sama.
+    valid_eval_df = add_source_frame(predictions, case)
     valid_eval_df = _build_track_key(valid_eval_df)
 
     if len(gt_df):
@@ -322,23 +219,22 @@ def _evaluate_tracking_outputs(
         tracking_eval_df = evaluate_tracking_with_gt(matched_df, gt_df)
         gt_coverage_df = build_gt_coverage_detail(matched_df, gt_df)
         track_summary_gt_df = build_track_summary_with_gt(matched_df)
+        track_gt_diagnostics_df = build_track_gt_diagnostics(
+            matched_df,
+            track_summary_df,
+            float(case.get("gt_iou_threshold", 0.50)),
+        )
         tracking_standard_metrics_df = build_tracking_standard_metrics(
             matched_df,
             gt_df,
             tracking_eval_df,
         )
-        gt_debug = build_gt_debug_info(
-            valid_eval_df,
-            gt_df,
-            matched_df,
-            case,
-            loader_debug=gt_loader_debug,
-        )
-        matched_df.to_csv(run_dir / "tracking_rows_with_gt.csv", index=False)
-        tracking_eval_df.to_csv(run_dir / "tracking_evaluation.csv", index=False)
-        gt_coverage_df.to_csv(run_dir / "gt_coverage_detail.csv", index=False)
-        track_summary_gt_df.to_csv(run_dir / "track_summary_with_gt.csv", index=False)
-        tracking_standard_metrics_df.to_csv(run_dir / "tracking_standard_metrics.csv", index=False)
+        matched_df.to_csv(output_dir / "tracking_rows_with_gt.csv", index=False)
+        tracking_eval_df.to_csv(output_dir / "tracking_evaluation.csv", index=False)
+        gt_coverage_df.to_csv(output_dir / "gt_coverage_detail.csv", index=False)
+        track_summary_gt_df.to_csv(output_dir / "track_summary_with_gt.csv", index=False)
+        track_gt_diagnostics_df.to_csv(output_dir / "track_gt_diagnostics.csv", index=False)
+        tracking_standard_metrics_df.to_csv(output_dir / "tracking_standard_metrics.csv", index=False)
         eval_outputs = {
             "gt_available": True,
             "gt_df": gt_df,
@@ -346,60 +242,55 @@ def _evaluate_tracking_outputs(
             "tracking_eval_df": tracking_eval_df,
             "gt_coverage_df": gt_coverage_df,
             "track_summary_gt_df": track_summary_gt_df,
+            "track_gt_diagnostics_df": track_gt_diagnostics_df,
             "tracking_standard_metrics_df": tracking_standard_metrics_df,
-            "gt_debug": gt_debug,
         }
+        if include_temporal_coverage:
+            gt_temporal_coverage_df, gt_temporal_coverage_summary_df = build_gt_temporal_coverage(matched_df, gt_df)
+            gt_temporal_coverage_df.to_csv(output_dir / "gt_temporal_coverage.csv", index=False)
+            gt_temporal_coverage_summary_df.to_csv(output_dir / "gt_temporal_coverage_summary.csv", index=False)
+            manifest_path = output_dir / "run_manifest.json"
+            try:
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            except Exception:
+                manifest = {}
+            if manifest_path.exists():
+                manifest["gt_temporal_coverage_path"] = str(output_dir / "gt_temporal_coverage.csv")
+                manifest["gt_temporal_coverage_summary_path"] = str(output_dir / "gt_temporal_coverage_summary.csv")
+                save_json(manifest, manifest_path)
+            eval_outputs["gt_temporal_coverage_df"] = gt_temporal_coverage_df
+            eval_outputs["gt_temporal_coverage_summary_df"] = gt_temporal_coverage_summary_df
     else:
         tracking_standard_metrics_df = build_tracking_standard_metrics(
             pd.DataFrame(),
             gt_df,
             pd.DataFrame(),
         )
-        tracking_standard_metrics_df.to_csv(run_dir / "tracking_standard_metrics.csv", index=False)
-        gt_debug = build_gt_debug_info(
-            valid_eval_df,
-            gt_df,
-            pd.DataFrame(),
-            case,
-            loader_debug=gt_loader_debug,
+        tracking_standard_metrics_df.to_csv(output_dir / "tracking_standard_metrics.csv", index=False)
+        if write_empty_details:
+            pd.DataFrame().to_csv(output_dir / "tracking_rows_with_gt.csv", index=False)
+            pd.DataFrame().to_csv(output_dir / "gt_coverage_detail.csv", index=False)
+            pd.DataFrame().to_csv(output_dir / "track_summary_with_gt.csv", index=False)
+        track_gt_diagnostics_df = build_track_gt_diagnostics(
+            pd.DataFrame(), track_summary_df, float(case.get("gt_iou_threshold", 0.50))
         )
+        track_gt_diagnostics_df.to_csv(output_dir / "track_gt_diagnostics.csv", index=False)
         eval_outputs = {
             "gt_available": False,
             "tracking_standard_metrics_df": tracking_standard_metrics_df,
-            "gt_debug": gt_debug,
+            "track_gt_diagnostics_df": track_gt_diagnostics_df,
         }
 
-    tracking_diagnostics_df = build_tracking_diagnostics(
-        raw_tracks_df=raw_tracks_all,
-        valid_tracks_df=valid_tracks_all,
-        valid_summary_df=valid_summary_all,
-        tracking_eval_df=eval_outputs.get("tracking_eval_df"),
-        gt_coverage_df=eval_outputs.get("gt_coverage_df"),
-    )
-    tracking_diagnostics_df.to_csv(run_dir / "tracking_diagnostics.csv", index=False)
-    tracking_hints = build_tracking_tuning_hints({"tracking_diagnostics_df": tracking_diagnostics_df})
-    pd.DataFrame(tracking_hints).to_csv(run_dir / "tracking_tuning_hints.csv", index=False)
-    save_tuning_hints(run_dir / "tuning_hints.json", tracking_hints)
+    if gt_loader_debug is not None:
+        eval_outputs["gt_debug"] = build_gt_debug_info(
+            valid_eval_df,
+            gt_df,
+            eval_outputs.get("matched_df", pd.DataFrame()),
+            case,
+            loader_debug=gt_loader_debug,
+        )
 
-    metrics_for_score = _tracking_metrics_for_score(
-        eval_outputs.get("tracking_eval_df"),
-        eval_outputs.get("gt_coverage_df"),
-        eval_outputs.get("track_summary_gt_df"),
-    )
-    tracking_score_df = _tracking_score_df(
-        valid_tracks_all,
-        metrics_for_score,
-        runtime_sec=0.0,
-        gt_available=eval_outputs.get("gt_available", False),
-    )
-    tracking_score_df.to_csv(run_dir / "flow1_tracking_score.csv", index=False)
-
-    return {
-        "tracking_diagnostics_df": tracking_diagnostics_df,
-        "tracking_tuning_hints": tracking_hints,
-        "tracking_score_df": tracking_score_df,
-        **eval_outputs,
-    }
+    return eval_outputs
 
 
 def run_tracking_stage(
@@ -410,61 +301,63 @@ def run_tracking_stage(
     run_dir: str | Path | None = None,
     progress_callback=None,
     cameras_to_run: list[str] | None = None,
+    camera_names: list[str] | None = None,
 ) -> dict:
     run_dir = Path(run_dir) if run_dir else create_run_dir(case)
     ensure_dir(run_dir)
 
     config_norm = normalize_config(config)
-    selected_cameras = list(cameras_to_run) if cameras_to_run else list(case["cameras"])
-    config_norm = _sync_dirty_single_camera_config(config_norm, selected_cameras)
+    selected_cameras = list(camera_names) if camera_names is not None else (list(cameras_to_run) if cameras_to_run else list(case["cameras"]))
+    unknown_cameras = set(selected_cameras).difference(case.get("cameras", []))
+    if unknown_cameras:
+        raise ValueError(f"Kamera tidak tersedia pada case: {sorted(unknown_cameras)}")
     if len(case.get("cameras", [])) > 3:
         raise ValueError("Multi-camera tracking mendukung maksimal 3 kamera/video.")
 
     expected_camera_tracking = {}
     for camera in case["cameras"]:
-        tracking_cfg, _ = get_camera_stage_config(config_norm, camera)
+        tracking_cfg, filter_cfg = get_camera_stage_config(config_norm, camera)
         cam_dir = run_dir / camera
         expected_camera_tracking[camera] = {
             "tracking": tracking_cfg,
-            "tracking_fingerprint": _tracking_fingerprint(tracking_cfg),
+            "tracking_fingerprint": _tracking_fingerprint(tracking_cfg, filter_cfg, case.get("video_files", {}).get(camera)),
             "tracker_yaml_path": str(cam_dir / "generated_tracker_config_used.yaml"),
             "tracking_runtime_manifest_path": str(cam_dir / "tracking_runtime_manifest.yaml"),
         }
 
     run_config = {
+        "run_id": run_dir.name,
         "case_id": case.get("case_id"),
-        "tracking_config_mode": config_norm.get("tracking_config_mode", "uniform"),
-        "tracking_preset": config_norm.get("tracking_preset"),
-        "filter_preset": config_norm.get("filter_preset"),
-        "reid_preset": config_norm.get("reid_preset"),
-        "tracking_config": config_norm.get("tracking", {}),
-        "filter_config": config_norm.get("filter", {}),
-        "reid_config": config_norm.get("reid", {}),
+        "config_mode": config_norm.get("config_mode", "initial_analysis"),
+        "tracking": config_norm.get("tracking", {}),
+        "filter": config_norm.get("filter", {}),
+        "reid": config_norm.get("reid", {}),
         "camera_configs": config_norm.get("camera_configs", {}),
         "camera_tracking_runtime": expected_camera_tracking,
         "tracking_fingerprints": {
             camera: data["tracking_fingerprint"]
             for camera, data in expected_camera_tracking.items()
         },
-        "custom": config_norm.get("custom", {}),
-        "case": case,
-        "raw_config": config,
     }
-    save_json(run_config, run_dir / "run_config.json")
+    save_json(run_config, run_dir / "config_used.json")
     save_json(
         {
-            **run_config,
-            "tracking": run_config["tracking_config"],
-            "filter": run_config["filter_config"],
-            "reid": run_config["reid_config"],
+            "run_id": run_dir.name,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "case_id": case.get("case_id"),
+            "config_mode": config_norm.get("config_mode", "initial_analysis"),
+            "output_dir": str(run_dir),
+            "tracking": config_norm.get("tracking", {}),
+            "filter": config_norm.get("filter", {}),
+            "camera_configs": config_norm.get("camera_configs", {}),
+            "reid": config_norm.get("reid", {}),
         },
-        run_dir / "config_used.json",
+        run_dir / "run_manifest.json",
     )
 
     gt_df, gt_loader_debug = load_case_ground_truth_debug(case)
     camera_config_summary = {}
     camera_results = {}
-    camera_outputs = {}
     camera_runtime = {}
     cameras_done = set()
 
@@ -473,14 +366,9 @@ def run_tracking_stage(
         video_path = Path(case["video_files"][camera])
         cam_dir = ensure_dir(run_dir / camera)
         tracking_cfg, filter_cfg = get_camera_stage_config(config_norm, camera)
-        camera_cfg = (config_norm.get("camera_configs") or {}).get(camera, {}) or {}
-        profile_key = camera_cfg.get("profile")
-        config_mode = "per_camera"
         tracking_runtime = expected_camera_tracking[camera]
         camera_config = {
             "camera": camera,
-            "profile": profile_key,
-            "config_mode": config_mode,
             "tracking": tracking_cfg,
             "filter": filter_cfg,
             "tracking_fingerprint": tracking_runtime["tracking_fingerprint"],
@@ -510,6 +398,7 @@ def run_tracking_stage(
             _release_yolo_model(yolo_model, use_cuda=use_cuda)
 
         # Filter valid track menentukan kandidat crop untuk Re-ID dan gallery lokal.
+        df = add_source_frame(_build_track_key(df), {**case, "cameras": [camera]})
         valid_df, summary_df = filter_valid_tracks(df, filter_cfg)
         df = _build_track_key(df)
         valid_df = _build_track_key(valid_df)
@@ -517,100 +406,26 @@ def run_tracking_stage(
         valid_summary_df = _valid_summary_only(summary_df)
 
         valid_df.to_csv(cam_dir / "local_tracks_valid.csv", index=False)
+        df.to_csv(cam_dir / "local_tracks.csv", index=False)
         summary_df.to_csv(cam_dir / "valid_track_summary.csv", index=False)
         local_gallery_df = build_local_track_gallery(
             valid_summary_df,
             cam_dir / "gallery_local",
-            extra_meta={"profile": profile_key, "config_mode": config_mode},
         )
 
         cam_gt_df = gt_df[gt_df["camera"] == camera].copy() if len(gt_df) else pd.DataFrame()
-        cam_eval = {}
-        if len(cam_gt_df):
-            valid_eval_df = add_source_frame(valid_df, {**case, "cameras": [camera]})
-            valid_eval_df = _build_track_key(valid_eval_df)
-            matched_df = match_predictions_to_gt(
-                valid_eval_df,
-                cam_gt_df,
-                iou_threshold=float(case.get("gt_iou_threshold", 0.50)),
-            )
-            matched_df = _build_track_key(matched_df)
-            tracking_eval_df = evaluate_tracking_with_gt(matched_df, cam_gt_df)
-            gt_coverage_df = build_gt_coverage_detail(matched_df, cam_gt_df)
-            track_summary_gt_df = build_track_summary_with_gt(matched_df)
-            tracking_standard_metrics_df = build_tracking_standard_metrics(
-                matched_df,
-                cam_gt_df,
-                tracking_eval_df,
-            )
-            matched_df.to_csv(cam_dir / "tracking_rows_with_gt.csv", index=False)
-            tracking_eval_df.to_csv(cam_dir / "tracking_evaluation.csv", index=False)
-            gt_coverage_df.to_csv(cam_dir / "gt_coverage_detail.csv", index=False)
-            track_summary_gt_df.to_csv(cam_dir / "track_summary_with_gt.csv", index=False)
-            tracking_standard_metrics_df.to_csv(cam_dir / "tracking_standard_metrics.csv", index=False)
-            metrics_for_score = _tracking_metrics_for_score(
-                tracking_eval_df,
-                gt_coverage_df,
-                track_summary_gt_df,
-            )
-            score_df = _tracking_score_df(
-                valid_df,
-                metrics_for_score,
-                gt_available=True,
-                valid_summary_df=summary_df,
-            )
-            cam_eval = {
-                "gt_available": True,
-                "matched_df": matched_df,
-                "tracking_eval_df": tracking_eval_df,
-                "gt_coverage_df": gt_coverage_df,
-                "track_summary_gt_df": track_summary_gt_df,
-                "tracking_standard_metrics_df": tracking_standard_metrics_df,
-                "tracking_score_df": score_df,
-            }
-        else:
-            empty_standard = build_tracking_standard_metrics(pd.DataFrame(), cam_gt_df, pd.DataFrame())
-            empty_standard.to_csv(cam_dir / "tracking_standard_metrics.csv", index=False)
-            pd.DataFrame().to_csv(cam_dir / "tracking_rows_with_gt.csv", index=False)
-            pd.DataFrame().to_csv(cam_dir / "gt_coverage_detail.csv", index=False)
-            pd.DataFrame().to_csv(cam_dir / "track_summary_with_gt.csv", index=False)
-            score_df = _tracking_score_df(
-                valid_df,
-                pd.DataFrame(),
-                gt_available=False,
-                valid_summary_df=summary_df,
-            )
-            cam_eval = {
-                "gt_available": False,
-                "tracking_standard_metrics_df": empty_standard,
-                "tracking_score_df": score_df,
-            }
+        cam_eval = _evaluate_tracking_scope(
+            {**case, "cameras": [camera]},
+            valid_df,
+            cam_gt_df,
+            cam_dir,
+            write_empty_details=True,
+            track_summary_df=summary_df,
+        )
 
         runtime = time.perf_counter() - start_camera
         camera_runtime[camera] = runtime
-        score_df["runtime_sec"] = round(float(runtime), 2)
-        score_df.to_csv(cam_dir / "flow1_tracking_score.csv", index=False)
 
-        cam_diag = build_tracking_diagnostics(
-            raw_tracks_df=df,
-            valid_tracks_df=valid_df,
-            valid_summary_df=summary_df,
-            tracking_eval_df=cam_eval.get("tracking_eval_df"),
-            gt_coverage_df=cam_eval.get("gt_coverage_df"),
-        )
-        cam_diag.to_csv(cam_dir / "tracking_diagnostics.csv", index=False)
-        cam_hints = build_tracking_tuning_hints({"tracking_diagnostics_df": cam_diag})
-        for hint in cam_hints:
-            hint["camera"] = camera
-        pd.DataFrame(cam_hints).to_csv(cam_dir / "tracking_tuning_hints.csv", index=False)
-
-        camera_outputs[camera] = {
-            "local_tracks": cam_dir / "local_tracks.csv",
-            "valid_tracks": cam_dir / "local_tracks_valid.csv",
-            "valid_summary": cam_dir / "valid_track_summary.csv",
-            "tracking_score": cam_dir / "flow1_tracking_score.csv",
-            "local_gallery": cam_dir / "gallery_local",
-        }
         camera_results[camera] = {
             "camera": camera,
             "run_dir": cam_dir,
@@ -618,10 +433,6 @@ def run_tracking_stage(
             "valid_tracks": valid_df,
             "valid_summary": summary_df,
             "local_gallery_df": local_gallery_df,
-            "tracking_diagnostics_df": cam_diag,
-            "tracking_tuning_hints": cam_hints,
-            "profile": profile_key,
-            "config_mode": config_mode,
             "runtime_sec": runtime,
             **cam_eval,
         }
@@ -643,7 +454,7 @@ def run_tracking_stage(
         expected_fingerprint = expected_camera_tracking.get(camera, {}).get("tracking_fingerprint")
         loaded_fingerprint = (loaded_camera_config or {}).get("tracking_fingerprint")
         if not loaded_fingerprint and (loaded_camera_config or {}).get("tracking"):
-            loaded_fingerprint = _tracking_fingerprint((loaded_camera_config or {}).get("tracking", {}))
+            loaded_fingerprint = _tracking_fingerprint((loaded_camera_config or {}).get("tracking", {}), (loaded_camera_config or {}).get("filter", {}), case.get("video_files", {}).get(camera))
         if (
             camera not in selected_cameras
             and expected_fingerprint
@@ -666,35 +477,13 @@ def run_tracking_stage(
                     "valid_tracks": _build_track_key(_read_csv_if_exists(valid_path)),
                     "valid_summary": _read_csv_if_exists(summary_path),
                     "local_gallery_df": _read_csv_if_exists(cam_dir / "gallery_local" / "local_gallery_index.csv"),
-                    "tracking_score_df": _read_csv_if_exists(cam_dir / "flow1_tracking_score.csv"),
                     "tracking_standard_metrics_df": _read_csv_if_exists(cam_dir / "tracking_standard_metrics.csv"),
                     "gt_coverage_df": _read_csv_if_exists(cam_dir / "gt_coverage_detail.csv"),
                     "track_summary_gt_df": _read_csv_if_exists(cam_dir / "track_summary_with_gt.csv"),
+                    "track_gt_diagnostics_df": _read_csv_if_exists(cam_dir / "track_gt_diagnostics.csv"),
                     "matched_df": _read_csv_if_exists(cam_dir / "tracking_rows_with_gt.csv"),
-                    "tracking_diagnostics_df": _read_csv_if_exists(cam_dir / "tracking_diagnostics.csv"),
-                    "profile": camera_config_summary.get(camera, {}).get("profile"),
-                    "config_mode": camera_config_summary.get(camera, {}).get("config_mode", "uniform"),
                     "runtime_sec": camera_runtime.get(camera, 0.0),
                 }
-
-    compact_camera_configs = {
-        camera: {
-            "profile": cfg.get("profile"),
-            "tracking": cfg.get("tracking", {}),
-            "filter": cfg.get("filter", {}),
-            "tracking_fingerprint": cfg.get("tracking_fingerprint"),
-            "tracker_yaml_path": cfg.get("tracker_yaml_path"),
-            "tracking_runtime_manifest_path": cfg.get("tracking_runtime_manifest_path"),
-        }
-        for camera, cfg in camera_config_summary.items()
-    }
-    save_json(
-        {
-            "camera_configs": compact_camera_configs,
-            "reid": config_norm.get("reid", {}),
-        },
-        run_dir / "tracking_config_per_camera.json",
-    )
 
     raw_tracks = []
     all_tracks = []
@@ -733,16 +522,18 @@ def run_tracking_stage(
         if valid_summaries
         else pd.DataFrame()
     )
-    if len(valid_summary_all) and "camera" in valid_summary_all:
-        valid_summary_all["profile"] = valid_summary_all["camera"].map(
-            lambda cam: camera_config_summary.get(cam, {}).get("profile")
-        )
-        valid_summary_all["config_mode"] = valid_summary_all["camera"].map(
-            lambda cam: camera_config_summary.get(cam, {}).get("config_mode", config_norm.get("tracking_config_mode", "uniform"))
-        )
-
     valid_summary_all.to_csv(run_dir / "valid_track_summary.csv", index=False)
-    valid_summary_all.to_csv(run_dir / "valid_track_summary_by_camera.csv", index=False)
+
+    track_counts = build_track_count_summary(
+        raw_tracks_all,
+        valid_tracks_all,
+        case.get("cameras", []),
+    )
+    track_count_by_camera_df = track_counts["by_camera_df"]
+    track_count_by_camera_df.to_csv(
+        run_dir / "track_count_summary_by_camera.csv",
+        index=False,
+    )
 
     # Gabungkan output semua kamera tanpa mengubah nama file konsumsi Streamlit.
     local_gallery_df = build_local_track_gallery(
@@ -750,97 +541,61 @@ def run_tracking_stage(
         run_dir / "gallery_local",
     )
 
-    eval_outputs = _evaluate_tracking_outputs(
+    eval_outputs = _evaluate_tracking_scope(
         case,
-        run_dir,
-        raw_tracks_all,
         valid_tracks_all,
-        valid_summary_all,
         gt_df,
+        run_dir,
         gt_loader_debug,
+        include_temporal_coverage=True,
+        track_summary_df=valid_summary_all,
     )
 
-    camera_score_rows = []
     camera_standard_rows = []
-    camera_coverage_rows = []
-    camera_hint_rows = []
-    gt_available_camera_count = 0
     for camera in case["cameras"]:
         result = camera_results.get(camera, {})
-        score_df = result.get("tracking_score_df", pd.DataFrame())
         standard_df = result.get("tracking_standard_metrics_df", pd.DataFrame())
-        coverage_df = result.get("gt_coverage_df", pd.DataFrame())
-        hints = result.get("tracking_tuning_hints", [])
-        cfg_meta = camera_config_summary.get(camera, {})
-        if len(score_df):
-            row = score_df.iloc[0].to_dict()
-        else:
-            row = _empty_tracking_score(0).iloc[0].to_dict()
-        row.update({
-            "camera": camera,
-            "profile": cfg_meta.get("profile"),
-            "config_mode": cfg_meta.get("config_mode", config_norm.get("tracking_config_mode", "uniform")),
-        })
-        camera_score_rows.append(row)
         if len(standard_df):
             srow = standard_df.iloc[0].to_dict()
-            if bool(srow.get("score_available", False)):
-                gt_available_camera_count += 1
             srow["camera"] = camera
             camera_standard_rows.append(srow)
-        if len(coverage_df):
-            cov = coverage_df.copy()
-            cov["camera"] = camera
-            camera_coverage_rows.append(cov)
-        for hint in hints:
-            camera_hint_rows.append(hint)
-
-    tracking_score_by_camera_df = pd.DataFrame(camera_score_rows)
-    if len(tracking_score_by_camera_df):
-        cols = ["camera"] + [c for c in tracking_score_by_camera_df.columns if c != "camera"]
-        tracking_score_by_camera_df = tracking_score_by_camera_df[cols]
-    tracking_score_by_camera_df.to_csv(run_dir / "tracking_score_by_camera.csv", index=False)
-
     standard_by_camera_df = pd.DataFrame(camera_standard_rows)
     standard_by_camera_df.to_csv(run_dir / "tracking_standard_metrics_by_camera.csv", index=False)
 
-    coverage_by_camera_df = pd.concat(camera_coverage_rows, ignore_index=True) if camera_coverage_rows else pd.DataFrame()
-    coverage_by_camera_df.to_csv(run_dir / "gt_coverage_by_camera.csv", index=False)
-
-    tracking_tuning_hints_by_camera_df = pd.DataFrame(camera_hint_rows)
-    tracking_tuning_hints_by_camera_df.to_csv(run_dir / "tracking_tuning_hints_by_camera.csv", index=False)
-
-    status_df = _camera_status_rows(case, run_dir, camera_config_summary, cameras_done)
+    status_df = _camera_status_rows(case, run_dir, cameras_done, camera_runtime)
     status_df.to_csv(run_dir / "camera_tracking_status.csv", index=False)
 
-    score_path = run_dir / "flow1_tracking_score.csv"
-    aggregate_score_df = _read_csv_if_exists(score_path)
-    if len(aggregate_score_df):
-        scored = tracking_score_by_camera_df[
-            _truthy_series(tracking_score_by_camera_df.get("score_available", pd.Series(dtype=object)))
-        ].copy() if len(tracking_score_by_camera_df) else pd.DataFrame()
-        aggregate_score_df["camera_score_mean"] = float(scored["tracking_score"].mean()) if len(scored) else None
-        aggregate_score_df["camera_score_min"] = float(scored["tracking_score"].min()) if len(scored) else None
-        aggregate_score_df["gt_available_camera_count"] = int(gt_available_camera_count)
-        aggregate_score_df["total_camera_count"] = int(len(case.get("cameras", [])))
-        aggregate_score_df.to_csv(score_path, index=False)
-        eval_outputs["tracking_score_df"] = aggregate_score_df
+    manifest_path = run_dir / "run_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception:
+        manifest = {}
+    manifest.update(
+        {
+            "output_schema_version": 2,
+            "raw_track_count": track_counts["raw_track_count"],
+            "valid_track_count": track_counts["valid_track_count"],
+            "filtered_track_count": track_counts["filtered_track_count"],
+            "track_count_summary_by_camera_path": str(
+                run_dir / "track_count_summary_by_camera.csv"
+            ),
+        }
+    )
+    save_json(manifest, manifest_path)
 
     return {
         "run_dir": run_dir,
         "raw_tracks_all": raw_tracks_all,
         "valid_tracks_all": valid_tracks_all,
         "valid_summary_all": valid_summary_all,
+        "raw_track_count": track_counts["raw_track_count"],
+        "valid_track_count": track_counts["valid_track_count"],
+        "filtered_track_count": track_counts["filtered_track_count"],
+        "track_count_by_camera_df": track_count_by_camera_df,
         "local_gallery_df": local_gallery_df,
-        "camera_outputs": camera_outputs,
         "camera_results": camera_results,
         "camera_status_df": status_df,
-        "tracking_score_by_camera_df": tracking_score_by_camera_df,
         "tracking_standard_metrics_by_camera_df": standard_by_camera_df,
-        "gt_coverage_by_camera_df": coverage_by_camera_df,
-        "tracking_tuning_hints_by_camera_df": tracking_tuning_hints_by_camera_df,
-        "tracking_diagnostics_df": eval_outputs["tracking_diagnostics_df"],
-        "tracking_tuning_hints": eval_outputs["tracking_tuning_hints"],
         **eval_outputs,
     }
 
@@ -866,65 +621,89 @@ def run_reid_stage(
 
     valid_df = pd.read_csv(valid_path)
     valid_df = _build_track_key(valid_df)
+    valid_df = add_source_frame(valid_df, case)
     stage_log = ["Tracking reused"]
 
     config_norm = normalize_config(config)
     reid_config_used = copy.deepcopy(config_norm.get("reid", {}))
-    raw_config_used = copy.deepcopy(config_norm)
-    raw_config_used["reid"] = copy.deepcopy(reid_config_used)
-    run_config_path = run_dir / "run_config.json"
+    run_config_path = run_dir / "config_used.json"
     run_config = {}
     if run_config_path.exists():
         try:
             run_config = json.loads(run_config_path.read_text(encoding="utf-8"))
         except Exception:
             run_config = {}
+    for key in ("tracking_config_mode", "tracking_preset", "filter_preset", "reid_preset", "visual_preset", "profile", "custom", "raw_config", "case", "tracking_config", "filter_config"):
+        run_config.pop(key, None)
     run_config.update(
         {
+            "run_id": run_dir.name,
             "case_id": case.get("case_id"),
-            "tracking_preset": config_norm.get("tracking_preset"),
-            "filter_preset": config_norm.get("filter_preset"),
-            "reid_preset": config_norm.get("reid_preset"),
-            "tracking_config": config_norm.get("tracking", {}),
-            "filter_config": config_norm.get("filter", {}),
-            "reid_config": reid_config_used,
+            "config_mode": config_norm.get("config_mode", "initial_analysis"),
+            "tracking": config_norm.get("tracking", {}),
+            "filter": config_norm.get("filter", {}),
+            "reid": reid_config_used,
+            "camera_configs": config_norm.get("camera_configs", {}),
             "reid_config_used": reid_config_used,
-            "custom": config_norm.get("custom", {}),
-            "case": case,
-            "raw_config": raw_config_used,
         }
     )
     save_json(run_config, run_config_path)
     save_json(reid_config_used, run_dir / "reid_config_used.json")
-    config_used_path = run_dir / "config_used.json"
-    config_used = {}
-    if config_used_path.exists():
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = {}
+    if manifest_path.exists():
         try:
-            config_used = json.loads(config_used_path.read_text(encoding="utf-8"))
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except Exception:
-            config_used = {}
-    config_used.update(
-        {
-            "reid_config": reid_config_used,
-            "reid_config_used": reid_config_used,
-            "reid": reid_config_used,
-            "custom": config_norm.get("custom", {}),
-            "raw_config": raw_config_used,
-        }
-    )
-    save_json(config_used, config_used_path)
+            manifest = {}
+    for key in ("configuration_mode", "tracking_config_mode", "tracking_preset", "filter_preset", "reid_preset", "visual_preset", "profile", "custom", "raw_config", "case", "tracking_config", "filter_config", "reid_config"):
+        manifest.pop(key, None)
+    manifest.update({
+        "run_id": run_dir.name,
+        "case_id": case.get("case_id"),
+        "config_mode": config_norm.get("config_mode", "initial_analysis"),
+        "output_dir": str(run_dir),
+        "reid": reid_config_used,
+    })
+    save_json(manifest, manifest_path)
 
     track_embedding_path = run_dir / "track_embedding_df.pkl"
     track_features_path = run_dir / "track_features.npy"
-    if track_embedding_path.exists() and track_features_path.exists():
-        sampled_df = _read_csv_if_exists(run_dir / "sampled_crop_df.csv")
-        track_embedding_df = pd.read_pickle(track_embedding_path)
-        track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
-        track_features = np.load(track_features_path)
-        stage_log.append("Embeddings reused")
-    else:
+    embedding_manifest_path = run_dir / "embedding_manifest.json"
+    # Sampling uses the originating camera configuration, not a fallback global filter.
+    sampled_df = build_sampled_track_crop_df(
+        valid_df,
+        config_norm["filter"],
+        config_norm.get("camera_configs", {}),
+    )
+    if len(sampled_df) == 0:
+        crop_paths = valid_df["crop_path"] if "crop_path" in valid_df else pd.Series(dtype=str)
+        existing_crops = int(sum(Path(str(path)).is_file() for path in crop_paths))
+        raise ValueError(
+            "Sampling crop Re-ID kosong: "
+            f"valid_track={valid_df['track_key'].nunique() if 'track_key' in valid_df else 0}, "
+            f"baris_valid={len(valid_df)}, crop_tersedia={existing_crops}, direktori={run_dir}."
+        )
+    expected_embedding_manifest = build_embedding_manifest(valid_df, sampled_df, osnet_weight)
+    cache_valid = (
+        track_embedding_path.exists()
+        and track_features_path.exists()
+        and embedding_manifest_path.exists()
+        and embedding_cache_is_valid(embedding_manifest_path, expected_embedding_manifest, track_features_path)
+    )
+    if cache_valid:
+        try:
+            track_embedding_df = pd.read_pickle(track_embedding_path)
+            track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
+            track_features = np.load(track_features_path)
+            if track_features.ndim != 2 or len(track_embedding_df) != len(track_features):
+                raise ValueError("cache embedding memiliki dimensi atau jumlah track yang tidak sesuai")
+            stage_log.append("Embeddings reused")
+        except Exception:
+            cache_valid = False
+            stage_log.append("Embedding cache invalid; recomputing")
+    if not cache_valid:
         # Ekstraksi embedding OSNet dilakukan per crop, lalu dirata-ratakan per track.
-        sampled_df = build_sampled_track_crop_df(valid_df, config_norm["filter"])
         sampled_df.to_csv(run_dir / "sampled_crop_df.csv", index=False)
 
         device = get_device(prefer_cuda=use_cuda)
@@ -946,12 +725,22 @@ def run_reid_stage(
             crop_features,
         )
         track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
+        if len(track_embedding_df) == 0 or track_features.size == 0:
+            raise RuntimeError("Embedding track kosong meskipun valid track dan crop tersedia.")
 
         track_embedding_df.to_pickle(track_embedding_path)
         track_embedding_df.to_csv(run_dir / "track_embedding_summary.csv", index=False)
         np.save(track_features_path, track_features)
+        embedding_manifest = build_embedding_manifest(
+            valid_df,
+            sampled_df,
+            osnet_weight,
+            feature_dim=track_features.shape[1] if track_features.ndim == 2 else None,
+        )
+        save_json(embedding_manifest, embedding_manifest_path)
         stage_log.append("Embeddings recomputed")
 
+    track_embedding_df = _merge_full_track_span(track_embedding_df, valid_df)
     pair_df = compute_track_similarity_df(track_embedding_df, track_features)
     stage_log.append("Re-ID recomputed")
 
@@ -1048,28 +837,6 @@ def run_reid_stage(
     reid_pairwise_eval_df.to_csv(run_dir / "reid_pairwise_evaluation.csv", index=False)
     reid_pairwise_detail_df.to_csv(run_dir / "reid_pairwise_detail.csv", index=False)
 
-    reid_diagnostics_df = build_reid_diagnostics(
-        track_embedding_df=track_embedding_df,
-        pair_df=pair_df,
-        global_meta_df=global_meta_df,
-        global_summary_df=global_summary_df,
-    )
-    reid_diagnostics_df.to_csv(run_dir / "reid_diagnostics.csv", index=False)
-
-    reid_result_seed = {
-        "reid_diagnostics_df": reid_diagnostics_df,
-    }
-    reid_hints = build_reid_tuning_hints(reid_result_seed, config_norm)
-    pd.DataFrame(reid_hints).to_csv(run_dir / "reid_tuning_hints.csv", index=False)
-
-    existing_hints = []
-    hints_path = run_dir / "tuning_hints.json"
-    if hints_path.exists():
-        try:
-            existing_hints = json.loads(hints_path.read_text(encoding="utf-8"))
-        except Exception:
-            existing_hints = []
-    save_tuning_hints(hints_path, existing_hints + reid_hints)
     save_json({"stage_log": stage_log}, run_dir / "reid_stage_log.json")
     (run_dir / "reid_stage_log.txt").write_text("\n".join(stage_log), encoding="utf-8")
 
@@ -1091,8 +858,6 @@ def run_reid_stage(
         "global_summary_df": global_summary_df,
         "reid_pairwise_eval_df": reid_pairwise_eval_df,
         "reid_pairwise_detail_df": reid_pairwise_detail_df,
-        "reid_diagnostics_df": reid_diagnostics_df,
-        "reid_tuning_hints": reid_hints,
         "reid_config_used": reid_config_used,
         "stage_log": stage_log,
     }

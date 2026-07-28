@@ -95,10 +95,6 @@ def build_local_track_gallery(
             row["track_purity"] = r.get("track_purity")
         if "track_gt_purity" in r:
             row["track_purity"] = r.get("track_gt_purity")
-        if "profile" in r:
-            row["profile"] = r.get("profile")
-        if "config_mode" in r:
-            row["config_mode"] = r.get("config_mode")
         if extra_meta:
             row.update(extra_meta)
         rows.append(row)
